@@ -9,9 +9,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# 数据库文件
-*.db
-*.sqlite3
+
 
 # 日志与报告
 *.log

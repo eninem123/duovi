@@ -60,8 +60,8 @@ class TestTradingSystem(unittest.TestCase):
         can_sell = self.pm.can_sell(positions[0])
         self.assertFalse(can_sell)
         
-        # 修改数据库中的 bought_at 时间为2小时前
-        old_time = (datetime.now() - timedelta(hours=2)).isoformat()
+        # 修改数据库中的 bought_at 时间为1天前 (满足 T+1 和 1小时锁仓)
+        old_time = (datetime.now() - timedelta(days=1)).isoformat()
         with self.pm.db.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE positions SET bought_at = ? WHERE symbol = ?", (old_time, "sh600598"))
@@ -75,8 +75,8 @@ class TestTradingSystem(unittest.TestCase):
         """测试止损触发逻辑"""
         self.pm.buy("sh600598", "北大荒", 10.0, 0.1, 11.5, 9.5, "Test")
         
-        # 修改为已过锁定期
-        old_time = (datetime.now() - timedelta(hours=2)).isoformat()
+        # 修改为已过锁定期 (模拟 T+1)
+        old_time = (datetime.now() - timedelta(days=1)).isoformat()
         with self.pm.db.get_connection() as conn:
             conn.execute("UPDATE positions SET bought_at = ? WHERE symbol = ?", (old_time, "sh600598"))
             conn.commit()

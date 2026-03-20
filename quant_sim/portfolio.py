@@ -38,10 +38,22 @@ class PortfolioManager:
         self.sync_total_assets()
 
     def can_sell(self, position):
-        """检查是否满足最少锁仓时间（1小时）"""
+        """
+        检查是否满足卖出条件：
+        1. 遵守 A 股 T+1 规则（当天买入，次日及以后方可卖出）
+        2. 满足最少锁仓时间（1小时，用户要求）
+        """
+        now = datetime.now()
         bought_at = datetime.fromisoformat(position["bought_at"])
+        
+        # 1. T+1 规则检查：买入日期必须早于当前日期
+        is_t_plus_1 = now.date() > bought_at.date()
+        
+        # 2. 锁仓时间检查（1小时）
         lock_minutes = self.trading_config.get("lock_period_minutes", 60)
-        return datetime.now() - bought_at >= timedelta(minutes=lock_minutes)
+        is_lock_expired = now - bought_at >= timedelta(minutes=lock_minutes)
+        
+        return is_t_plus_1 and is_lock_expired
 
     def check_exit_conditions(self, position):
         """

@@ -1,6 +1,7 @@
 import asyncio
 import schedule
 import time
+import datetime
 import logging
 from portfolio import PortfolioManager
 from mcp_agent import MCPAgent
@@ -14,8 +15,28 @@ class QuantTradingSystem:
         self.is_running = False
         self.last_buy_time = 0  # 记录上一次买入时间的时间戳
 
+    def is_market_open(self):
+        """检查当前是否为 A 股交易时间（9:30-11:30, 13:00-15:00）"""
+        now = datetime.datetime.now()
+        # 排除周末
+        if now.weekday() >= 5:
+            return False
+        
+        current_time = now.time()
+        morning_start = datetime.time(9, 30)
+        morning_end = datetime.time(11, 30)
+        afternoon_start = datetime.time(13, 0)
+        afternoon_end = datetime.time(15, 0)
+        
+        return (morning_start <= current_time <= morning_end) or \
+               (afternoon_start <= current_time <= afternoon_end)
+
     async def _trading_tick(self):
         """单次定时决策循环"""
+        if not self.is_market_open():
+            logging.info("当前非 A 股交易时段，系统休眠中...")
+            return
+
         logging.info("--- 开始新的交易决策周期 ---")
         self.portfolio.print_status()
 
@@ -30,9 +51,9 @@ class QuantTradingSystem:
                 self.portfolio.update_market_prices(price_dict)
                 self.portfolio.process_exits()
         
-        # 2. 检查买入冷却期 (例如距离上次买入至少间隔 4 小时 = 14400秒，防止高频建仓)
+        # 2. 检查买入冷却期 (按照用户要求：交易频次不快于 1 小时 = 3600秒)
         current_time = time.time()
-        cooldown_seconds = 4 * 3600
+        cooldown_seconds = 1 * 3600
         if current_time - self.last_buy_time < cooldown_seconds:
             logging.info(f"当前处于买入冷却期内 (还剩 {(cooldown_seconds - (current_time - self.last_buy_time))/60:.1f} 分钟)，跳过买入决策。")
             logging.info("--- 交易决策周期结束 ---\n")

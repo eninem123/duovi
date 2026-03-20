@@ -41,16 +41,34 @@ class MCPAgent:
             logging.error(f"Error calling {tool_name}: {str(e)}")
             return None
 
-    async def get_market_data(self, queries=["上证指数", "贵州茅台", "宁德时代", "比亚迪", "中际旭创", "紫金矿业"]):
+    async def get_market_data(self):
         """获取当前市场行情摘要作为决策输入"""
-        logging.info("获取 A 股最新行情数据...")
-        # 这里为了简化，查询几个代表性股票和指数。可以根据需要扩大范围
-        result_text = await self._call_tool(
+        logging.info("获取 A 股最新宏观与行业板块行情数据...")
+        
+        # 1. 获取概念板块与行业板块数据（寻找当前资金主攻方向）
+        industry_data = await self._call_tool(
+            self.stock_params,
+            "get_industry_list",
+            {}
+        )
+        
+        # 2. 获取核心宽基指数与避险标的
+        index_queries = ["上证指数", "中证500", "沪深300", "黄金ETF", "北大荒", "农业ETF"]
+        index_data = await self._call_tool(
             self.stock_params, 
             "get_quotes_by_query", 
-            {"queries": queries}
+            {"queries": index_queries}
         )
-        return result_text
+        
+        # 组合成完整的市场上下文
+        market_context = f"""
+        【宽基指数与核心标的实时状态】：
+        {index_data}
+        
+        【当前行业板块资金流向与涨跌概况】：
+        {industry_data}
+        """
+        return market_context
 
     async def update_holdings_prices(self, symbols):
         """批量获取持仓股票最新价格"""

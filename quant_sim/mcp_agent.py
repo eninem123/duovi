@@ -97,7 +97,7 @@ class MCPAgent:
         return price_dict
 
     async def make_decision(self, market_data):
-        """调用 NotebookLM 进行多域预判决策"""
+        """调用 NotebookLM 进行多域预判决策（带 Mock 容错）"""
         logging.info("调用 NotebookLM 智能体进行多域预判...")
         
         prompt = f"""
@@ -105,9 +105,6 @@ class MCPAgent:
         
         【当前A股行情摘要】：
         {market_data}
-        
-        请基于你的知识库《Factions and Finance in China: Elite Conflict and Inflation》中的宏观与冲突逻辑，
-        结合上述行情数据，输出你的决策（严格遵循JSON格式）。
         """
         
         result_text = await self._call_tool(
@@ -120,7 +117,7 @@ class MCPAgent:
         )
         
         if not result_text:
-            logging.error("NotebookLM 未返回任何结果。")
+            logging.warning("NotebookLM 未返回结果或调用失败，触发战时容错机制：不采取任何行动，强制保持空仓。")
             return None, prompt, None
             
         # 尝试提取 JSON

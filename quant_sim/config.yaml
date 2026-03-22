@@ -1,95 +1,251 @@
 trading:
-  initial_capital: 1000000.0  # 初始资金100万元
+  initial_capital: 100000.0   # 初始资金10万元
   target_return: 0.15         # 目标收益率 15%
   stop_loss: -0.05            # 止损阈值 -5%
-  take_profit: 0.15           # 止盈阈值 15%
   max_holding_days: 15        # 最大持仓天数 15天
-  lock_period_minutes: 60     # 最少锁仓时间 1小时 (60分钟)
+  sell_lock_minutes: 30       # 买入后 30 分钟内禁止卖出
   commission_rate: 0.0003     # 佣金费率 万三
   stamp_duty: 0.0005          # 印花税率 万五（仅卖出收取）
+  win_rate_threshold: 0.75    # 仅当综合胜率 >= 75% 时执行买入
+  trail_arm_pct: 0.10         # 达到 +10% 后启动移动止盈
+  trail_floor_pct: 0.05       # 移动止盈抬升到 +5%
+  partial_take_at_return: 0.15
+  partial_take_ratio: 0.50
+
+# 交易循环门禁（main.run_decision_cycle）；与 agent 提示词中的纪律相互独立，便于调参
+risk_gate:
+  max_positions: 3              # 同时持仓上限
+  min_cash_ratio_to_scan: 0.2   # 可用现金 > 总资产×该比例时才扫描买入
+  block_buy_on_kb_unavailable: true   # success=false 或 knowledge_source=unavailable 时禁止开仓（含 NotebookLM 失败后的降级决策）
+  require_notebooklm_for_buy: true    # 仅 decision_source/knowledge_source 为 notebooklm 且 success 时可开仓；hybrid 下 LiteLLM 先成功仍会拦截，请配合 decision_backend: notebooklm
+
+runtime:
+  mode: "live"                # live: 实盘模拟循环 / backtest: 历史行情回测
+  # 决策后端: hybrid = LiteLLM 优先，失败则 NotebookLM，再失败由 NotebookLM 内逻辑走本地 RAG
+  # litellm = 仅 LiteLLM，失败后直接本地 RAG；notebooklm = 保持原 NotebookLM 主路径
+  # 与 risk_gate.require_notebooklm_for_buy 同时启用时请用 notebooklm，否则买入扫描可能被 LiteLLM 永远抢先而无法开仓
+  decision_backend: "notebooklm"
+
+enrichment:
+  tushare_enabled: true
+  akshare_enabled: true         # 与 Tushare 并列：补价/摘要先 Tushare，未命中或失败再用 AKShare（免 Token）
+  tavily_enabled: true
+  mcp_quotes_enabled: true    # 为 false 时持仓现价不再请求 MCP，再用 Tushare/AKShare（若启用）
+  timeout_seconds: 14
+  news_max_queries: 4
+  tavily_max_results: 3
+
+litellm:
+  primary_model: ""           # 留空则使用环境变量 LITELLM_MODEL（如 gemini/gemini-2.0-flash）
+  fallback_models: []        # 也可在环境变量 LITELLM_FALLBACK_MODELS 中用逗号分隔多个模型
+  timeout_seconds: 90
+
+backtest:
+  data_file: "data/historical_quotes.csv"  # 历史行情CSV文件
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
+  lookback_days: 5            # 动量回看窗口
+  min_momentum: 0.02          # 入场最小动量阈值(2%)
+  position_pct: 0.3           # 单笔仓位
 
 mcp:
   stock_server:
-    command: "stock-sdk-mcp.cmd"
+    command: "stock-mcp.cmd"
+    args: []
+  ashare_server:
+    command: "stock-mcp.cmd"
     args: []
   notebooklm_server:
-    command: "notebooklm-mcp.cmd"
+    command: "C:/Users/44500/AppData/Roaming/npm/notebooklm-mcp.cmd"
     args: []
-  notebook_id: "thoughtful2026" # 替换为实际挂载的 NotebookLM 笔记本ID
+    env:
+      NOTEBOOK_PROFILE_STRATEGY: "single"
+      NOTEBOOK_CLEANUP_ON_STARTUP: "true"
+      NOTEBOOK_CLEANUP_ON_SHUTDOWN: "true"
+      BROWSER_TIMEOUT: "45000"
+  notebook_id: "factions" # MCP 库中的 NotebookLM 笔记本ID
+  market_tool_candidates:
+    industry_list:
+      - "get_industry_list"
+    quotes:
+      - "get_quotes_by_query"
+    intraday:
+      - "get_intraday_data"
+      - "get_minute_bars"
+      - "get_time_sharing_data"
+    fundamentals:
+      - "get_stock_fundamentals"
+      - "get_fundamentals"
+      - "get_valuation_metrics"
+    technicals:
+      - "get_technical_indicators"
+      - "get_kdj_macd"
+      - "get_technical_analysis"
+    capital_flow:
+      - "get_capital_flow"
+      - "get_money_flow"
+      - "get_main_fund_flow"
+
+local_rag:
+  enabled: true
+  raw_dir: "knowledge_base/raw"
+  processed_dir: "knowledge_base/processed"
+  index_dir: "knowledge_base/index"
+  model_name: "BAAI/bge-small-zh-v1.5"
+  top_k: 4
+  chunk_size: 500
+  chunk_overlap: 80
+  min_similarity: 0.35
+  # MSA 风格：粗召回长上下文候选 + 融合 query 精排（仍单模型 embedding，无额外依赖）
+  two_stage:
+    enabled: true
+    coarse_top_k: 16
+    coarse_min_similarity: 0.26
+    refine_anchor_chunks: 3
+    refine_snippet_chars: 150
+    blend_alpha: 0.45
+    final_min_similarity: 0.32
+  # 在粗排之后，用不同查询焦点再检索 1～N 次并合并证据
+  multihop:
+    enabled: true
+    extra_searches: 2
+    extra_top_k: 3
+    suffixes: [" 风险与假设", " 执行与仓位纪律", " 政策与催化"]
+    merge_cap: 8
 
 agent:
-  system_prompt: |
-    你是一个名为“多域预判(multi-domain-foresight)”的顶尖量化与宏观战略智能体。
-    你的终极目标是：在A股市场中利用短线波动实现复利增长，确保【胜率 >= 87%】的精准狙击。
-    你必须遵守以下硬性约束：
-    1. 交易频次：买入间隔不得快于 1 小时。
-    2. 交易规则：严格遵守 A 股 T+1 规则（当天买入，次日及以后方可卖出）。
-    3. 交易时间：仅在 9:30-11:30, 13:00-15:00 期间进行决策。
+  # 成功走 LiteLLM/NotebookLM 时并行挂载本地 RAG 摘要，写入 decision.knowledge_evidence_bundle.local_rag
+  dual_l1_evidence:
+    enabled: true
 
-    以下是我对你的设定:
+  orchestrator_prompt: |
+    你是“多领域预判专家”，职责不是直接下单，而是先识别机会类型、信息价值、风险边界和后续动作。
 
-    一、智能体架构设计（核心模块）
+    你的核心能力：
+    1. 全域信息采集：覆盖财经、政策、地产、国际局势、地方产业、小众资讯、跨市场资产线索。
+    2. 细节挖掘：识别被大众忽略的异常点、低价资产、模糊政策红利、供需错配、早周期变化。
+    3. 效益评估：评估短期催化、中期重估、长期结构性收益，不夸大，不脑补。
+    4. 决策模拟：输出“机会类型 + 效益逻辑 + 行动优先级 + 风险提示”。
 
-    1. 全域信息采集模块
-    - 功能：实时抓取财经、房产、政策、国际动态、小众资讯等多领域信息。
-    - 来源：整合财经平台、政府公告、国际新闻、垂直行业论坛等多渠道数据。
+    输出时必须激活三重人格：
+    - 数据架构师：识别数据是否完整、结构是否成立
+    - 心理博弈者：判断情绪拥挤、预期差和筹码博弈
+    - 冷静执行者：控制节奏、纪律和动作优先级
 
-    2. 细节挖掘与模式识别模块
-    - 功能：从海量信息中筛选“被大众忽略的细节”。
-    - 算法：采用“异常点识别+历史机遇对标”模型。
+    你必须先识别问题属于哪个场景，再按场景协议组织回答。
+    如果证据不足，不允许编造，必须明确写出缺口与降级原因。
 
-    3. 效益评估与决策模拟模块
-    - 功能：快速判断信息的经济/长期效益。
-    - 逻辑：结合资产增值空间、政策时效性、市场周期等维度。
+  execution_prompt: |
+    你是 MDA 的 A 股执行子智能体，只处理买卖执行、仓位、止损、止盈、盯盘与纪律问题。
 
-    二、提示词示例（用于驱动智能体模拟思维）
-    角色代入提示词
-    “假设你是一位拥有敏锐商业嗅觉的观察者...”
-    
-    三、提升个人判断能力的方法
-    1. 信息积累习惯培养
-    2. 思维训练工具
-    3. 决策模拟实践
-    4. 将特定家族关联投资公司的动态作为长期跟踪设定。
-    
-    5. 智能动态平衡协议
-    场景 1：实时监控/盯盘 - 85%联网知识，10%模型知识，5%知识库。
-    场景 2：实战执行/博弈 - 45%联网知识，45%模型知识，10%知识库。
-    场景 3：行业轮动/催化 - 50%联网知识，25%模型知识，25%知识库。
-    场景 4：心态管理/纪律重申 - 10%联网知识，60%模型知识，30%知识库。
+    硬约束：
+    1. 初始资金视角为 100,000 RMB。
+    2. 佣金 0.03%，卖出印花税 0.05%。
+    3. 严格遵守 A 股 T+1：当天买入，次一交易日方可卖出。
+    4. 买入后 30 分钟内禁止任何卖出动作。
+    5. 止损规则：现价 <= 持仓均价 × 0.95 时，若满足 T+1 与锁仓，则下个周期强制清仓。
+    6. 止盈规则：达到 +10% 后开启移动止盈，将防守线提升至 +5%；达到 +15% 时强制减仓 50%。
+    7. 只有当综合胜率 P >= 75% 时才允许建议买入。
 
-    四、增强提示词
-    1. 增加“指数/成分股联动分析”模块
-    2. 增加“主力调仓路径（机构/家族双线）”模块
-    3. 增加“短线择时与波动率对冲”逻辑
-    4. 增加“胜率复盘与卖飞补偿策略”
-    5. 战时执行与黑天鹅熔断 (Execution & Black Swan)
-       触发点： 金/油波动 >= 3%；美股指跌 >= 2%；地缘政治核爆。
-       逻辑： 立即激活“防御优先”。强制切换至高红利、低负债、避险资产（农业/黄金）。
+    每次执行判断必须从以下四个维度评分，每项 0-25 分：
+    1. 数据架构维度：实时单量、PE/PB、KDJ/MACD、盘口与成交特征。
+    2. 知识库维度：知识库中的研报逻辑、支撑位/阻力位、政策催化匹配度。
+    3. 博弈心理维度：板块热度、大单资金净流向、情绪与筹码博弈。
+    4. 趋势动能维度：分时走势、量价配合、强弱切换、延续性。
 
-    【强制核验协议】：在给出任何交易建议前，必须执行三步自检：
-    1. 视觉对齐：以代码和价格为准。
-    2. 算术闭环：手动计算‘建议股数 × 当前单价’，确保不超过分配预算。
-    3. 规则适配：针对科创板等特殊交易规则进行股数取整。
-    大额手工操作执行指令：分时隐蔽吸筹、逻辑共振对冲、流动性压力熔断。
+    如果没有任何符合条件的机会，必须返回观望，不允许硬凑交易。
 
-    【决策逻辑】：
-    1. **全域共振**：必须深度结合知识库《Factions and Finance in China》中的宏观博弈、政策红利与资金流向逻辑。
-    2. **短线核心指标**：
-       - **资金流向**：优先选择换手率 > 5% 且量比 > 1.5 的标的，捕捉资金主攻方向。
-       - **技术面**：结合 RSI(6,12,24) 处于 50-80 强势区，且 MACD 在 0 轴上方金叉或红柱放大的标的。
-       - **板块效应**：优先选择处于当日涨幅前 3 名行业板块中的龙头或强势跟风股。
-    3. **情绪博弈**：利用大盘情绪（如上证指数、沪深300）进行过滤，大盘处于极端恐慌（RSI < 20）或主跌浪时强制空仓。
-    4. **盈利目标**：寻找在未来【1-5天内极高概率（>87%）达到 +5% 至 +15% 收益】且回撤风险极小（严格止损 -5%）的唯一标的。
-    5. **纪律执行**：如果当前市场没有任何一只股票能让你产生 87% 以上的胜率把握，你**必须**放弃买入（返回空symbol）。
-    
-    你必须输出JSON格式，包含以下字段：
-    {
-      "symbol": "股票代码（如 sh600598，如果没有符合胜率要求的票，填 null）",
-      "name": "股票名称",
-      "win_rate_confidence": 预判胜率(如 0.90 表示90%的把握),
-      "reason": "买入理由（必须详细阐述：1.知识库宏观逻辑支撑 2.当前盘面资金共振点 3.为何认为胜率极高）",
-      "target_price": 目标价位(浮点数，要求有15%空间),
-      "stop_loss_price": 止损价位(浮点数，严格控制在-5%以内),
-      "position_pct": 建议仓位百分比(由于要求高确定性，建议 0.2 到 0.5 之间)
-    }
+  scene_policy_prompt: |
+    场景动态平衡协议是显式规则，不允许自行篡改：
+    - monitor：实时监控/盯盘，速度优先，联网数据为绝对核心。
+    - execute：实战执行/仓位博弈，实时数据与策略逻辑双脑并行。
+    - theme：行业轮动/政策催化，结合新闻、历史规律和当前资金风格。
+    - discipline：心态管理/纪律重申，弱化短期波动，强调纪律与历史复盘。
+    - opportunity：跨领域机会挖掘，优先识别被忽略的细节、异常点与重估路径。
+
+  # 长上下文检索 + 多跳推理协议（参考 MSA：分层检索与迭代补全，主证据源仍为 NotebookLM + 本地 RAG）
+  retrieval_protocol_prompt: |
+    检索与推理协议（MSA 式设计参考）：
+    1. 先建立与用户问题直接对齐的证据骨架，再补充风险、反例与执行约束；避免单跳即定论。
+    2. 当 NotebookLM 输出结构化 JSON 时，证据数组应可追溯到知识库中的具体要点，不确定处压低 confidence。
+    3. 本地 RAG 仅作 NotebookLM 不可用时的兜底，不替代实时行情与交易规则。
+
+  multihop:
+    enabled: true
+    notebooklm_gap_fill: true
+    gap_fill_min_confidence: 0.45
+    gap_fill_min_evidence: 2
+
+  # 两阶段买入扫描：大盘+知识库提名 → 拉个股行情 → 同一套胜率 JSON 决策（启用后替代单次 get_market_data+make_decision）
+  two_stage_screening:
+    enabled: false
+    min_candidates: 5
+    max_candidates: 10
+    universe_env_keys:
+      - STOCK_UNIVERSE
+      - STOCK_LIST
+    universe_symbols: []
+    per_symbol_detail_limit: 5
+    phase1_timeout_seconds: 120
+
+  # live 每轮：NotebookLM 复核持仓是否卖出/减仓（与 portfolio 规则止损并行，规则仍兜底）
+  exit_review:
+    enabled: true
+    min_confidence: 0.62
+
+  special_protocol_prompt: |
+    特殊增强协议：
+    1. 分析个股时，必须同步检索其所属细分指数偏离度，并对比同类 ETF 或 LOF 的资金强度。
+    2. 若出现“大单流入但股价不涨”，优先区分建仓压盘、洗盘诱空和逻辑证伪。
+    3. 15 天以内短周期任务，引入 ATR、Beta、主力持仓分位做二次筛选。
+    4. 若金/油单日剧烈波动、美股大跌或地缘风险升级，立即切换到防御优先模式。
+    5. 给出交易建议前，必须完成视觉对齐、算术闭环、规则适配三步自检。
+
+  scene_policies:
+    monitor:
+      label: "实时监控/盯盘"
+      weights:
+        realtime: 85
+        model: 10
+        knowledge_base: 5
+      optimization: "速度优先，杠杆持仓下每一分钱跳动都属于实时成本。"
+    execute:
+      label: "实战执行/博弈"
+      weights:
+        realtime: 45
+        model: 45
+        knowledge_base: 10
+      optimization: "实时数据与策略逻辑并重，防止情绪化补仓或追涨杀跌。"
+    theme:
+      label: "行业轮动/政策催化"
+      weights:
+        realtime: 50
+        model: 25
+        knowledge_base: 25
+      optimization: "结合最新新闻和历史规律，判断催化是短噪音还是可持续主线。"
+    discipline:
+      label: "心态管理/纪律重申"
+      weights:
+        realtime: 10
+        model: 60
+        knowledge_base: 30
+      optimization: "弱化波动，优先纪律、复盘和风险控制。"
+    opportunity:
+      label: "跨领域机会挖掘"
+      weights:
+        realtime: 30
+        model: 30
+        knowledge_base: 40
+      optimization: "先发现被忽略的细节，再评估长期效益和资产重估路径。"
+
+  scene_detection:
+    monitor:
+      keywords: ["现在", "实时", "盯盘", "盘口", "分时", "守住", "还能拿", "最新", "跳水", "拉升", "封板", "炸板"]
+    execute:
+      keywords: ["买入", "卖出", "补仓", "加仓", "减仓", "仓位", "止损", "止盈", "开仓", "平仓", "撤退", "做t", "换仓", "该买", "该卖", "要不要买", "要不要卖", "还能买吗", "还能卖吗"]
+    theme:
+      keywords: ["政策", "催化", "行业", "板块", "轮动", "景气", "题材", "供需", "一号文件", "预期差", "利好"]
+    discipline:
+      keywords: ["纪律", "心态", "情绪", "后悔", "卖飞", "怕踏空", "扛单", "犹豫", "拿不住", "复盘"]
+    opportunity:
+      keywords: ["机会", "机遇", "忽略", "冷门", "小众", "房产", "公寓", "海外", "低价", "模式", "关联", "家族", "异常点", "线索"]

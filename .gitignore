@@ -1,1 +1,20 @@
 .venv
+.env
+**/.env
+
+# Python cache and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Quant sim runtime artifacts
+quant_sim/logs/
+quant_sim/reports/
+quant_sim/__pycache__/
+quant_sim/quant_sim.db
+quant_sim/test_quant_sim*.db
+
+# Future local knowledge / indexing artifacts
+quant_sim/knowledge_base/processed/
+quant_sim/knowledge_base/index/
+quant_sim/runtime/

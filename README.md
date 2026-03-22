@@ -1,86 +1,214 @@
-# A股量化模拟交易系统 (基于 MCP 与 AI Agent)
+# A股量化模拟交易系统 (MCP + NotebookLM + 本地RAG)
 
-这是一个完全基于 Model Context Protocol (MCP) 与大语言模型（AI Agent）驱动的A股全自动量化模拟交易系统。系统通过双路 MCP 连接，实现“数据获取 - 知识检索 - 逻辑预判 - 模拟交易 - 资金管理”的全链路自动化闭环。
+这是一个面向 A 股模拟交易的自动化系统。  
+核心思路是：用 MCP 获取实时行情，用 NotebookLM + 本地 RAG 提供知识证据，由 Agent 输出结构化决策，再由交易与风控模块执行。
 
-## 🌟 核心特性
+---
 
-- **双路 MCP 驱动引擎**
-  - **`stock-sdk-mcp`**: 实时获取 A 股行情数据（包括涨幅榜、资金流向等作为决策上下文），以及持仓股票的最新价。
-  - **`notebooklm-mcp`**: 挂载专属的 NotebookLM 知识库（例如包含《Factions and Finance in China》宏观分析），赋予智能体多域预判能力。
-- **严格的交易纪律管理**
-  - 单只股票持仓周期 15 天，目标收益率设定为 15%。
-  - T+0 锁仓限制：买入后强制锁仓至少 1 小时方可卖出。
-  - 动态止损/止盈：自动计算并执行回撤止损（默认 -5%）与止盈（默认 +15%）策略。
-- **全息资金与持仓追踪**
-  - 支持自定义初始资金（默认 100 万元），资金余额与总资产实时更新。
-  - 严格计算交易成本（包含万三佣金与万五印花税）。
-- **结构化决策日志**
-  - 使用 SQLite 数据库持久化存储：系统不仅记录交易流水，还会完整记录每次智能体的 **Prompt、知识库引用片段以及原始决策逻辑**，方便事后回溯与归因分析。
+## 1. 当前项目能做什么
 
-## 📁 项目结构
+- **定时轮询（live）**：按固定分钟间隔自动跑一轮决策。
+- **持仓管理**：支持 T+1、买入后锁仓、止损、移动止盈、部分减仓、持仓时长控制。
+- **智能体买入决策**：仅在综合胜率达到阈值时买入。
+- **智能体卖出复核**：每轮先让智能体评估 `hold / partial / sell`，再由规则兜底。
+- **NotebookLM 为主，本地 RAG 为兜底**：
+  - NotebookLM 可用时优先用 NotebookLM；
+  - 不可用时回退到本地 RAG；
+  - 本地 RAG 支持两阶段检索与多跳合并。
+- **可追溯日志**：保存交易流水、MDA 快照、决策输入输出。
+
+---
+
+## 2. 目录与核心文件
 
 ```text
 quant_sim/
-├── config.yaml          # 核心配置文件（资金、费率、策略参数、MCP配置）
-├── main.py              # 主调度程序（5分钟定时执行决策循环）
-├── mcp_agent.py         # MCP 客户端封装（对接 Stock 与 NotebookLM）
-├── portfolio.py         # 资产与订单管理器（买卖逻辑、费用计算、退出条件判断）
-├── database.py          # SQLite 数据库底层封装
-├── test_system.py       # 单元测试（测试手续费、锁仓、止损等核心逻辑）
-├── report.py            # 回测与运行报告生成器
-└── requirements.txt     # Python 依赖清单
+├── config.yaml          # 核心配置（交易规则、MCP、Agent、RAG）
+├── main.py              # live/backtest/chat 入口，定时调度在这里
+├── mcp_agent.py         # MCP 调用、NotebookLM问答、多跳策略
+├── portfolio.py         # 持仓与风控执行（sell/sell_partial/process_exits）
+├── database.py          # SQLite封装
+├── report.py            # Markdown/HTML 报告
+├── web_app.py           # Web 聊天和看板
+└── requirements.txt
 ```
 
-## 🚀 快速开始
+文件治理约定：
+- `quant_sim/data/`：受版本管理的输入数据（如回测行情）
+- `quant_sim/knowledge_base/raw/`：本地知识原始文档
+- `quant_sim/knowledge_base/processed/`、`quant_sim/knowledge_base/index/`：索引产物
+- `quant_sim/logs/`、`quant_sim/reports/`、`quant_sim/*.db`：运行产物
 
-### 1. 环境准备
+---
 
-确保您的机器已安装 Python 3.10+ 和 Node.js（用于运行 MCP）。
-同时，您需要在 Trae 或本地环境中配置好并登录 NotebookLM。
+## 3. 环境准备
 
-### 2. 安装依赖
+前置：
+- Python 3.10+
+- Node.js（用于 MCP 命令）
+- 已可用的 NotebookLM 账户与 `notebooklm-mcp`
+
+安装 MCP（示例）：
 
 ```bash
-# 建议使用虚拟环境
-python -m venv .venv
-source .venv/Scripts/activate  # Windows
-# source .venv/bin/activate    # macOS/Linux
+npm install -g stock-sdk-mcp
+```
 
+安装 Python 依赖：
+
+```bash
+cd quant_sim
+python -m venv .venv
+.\.venv\Scripts\activate   # Windows
 pip install -r requirements.txt
 ```
 
-### 3. 修改配置
+---
 
-打开 `config.yaml`，根据您的实际环境修改以下字段：
-- `initial_capital`: 初始模拟资金。
-- `notebook_id`: 您在 NotebookLM 中对应的知识库 ID。
-- `system_prompt`: 智能体的核心人设与选股要求。
+## 4. 启动、关闭与常用命令
 
-### 4. 运行系统
+### 4.1 live 轮询（自动交易循环）
 
 ```bash
-# 启动 5 分钟定时自动交易循环
-python main.py
+cd quant_sim
+python -u main.py --mode live --interval 5
 ```
 
-### 5. 运行测试与生成报告
+- `--interval 5` 表示每 5 分钟一轮
+- 前台运行时，按 `Ctrl + C` 停止
+
+后台运行（Windows PowerShell）：
+
+```powershell
+Start-Process python -ArgumentList "main.py --mode live --interval 5" -WorkingDirectory "E:\duovi\quant_sim"
+```
+
+后台停止（Windows PowerShell）：
+
+```powershell
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -match "quant_sim\\main.py|quant_sim/main.py" } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```
+
+### 4.2 chat 模式（持续问答）
 
 ```bash
-# 执行核心逻辑单元测试
-python test_system.py
+python -u main.py --mode chat
+```
 
-# 生成当前账户状态与交易记录报告（将输出到 reports 目录）
+### 4.3 backtest 模式（历史回测）
+
+```bash
+python -u main.py --mode backtest
+```
+
+---
+
+## 5. 系统运行逻辑（重点）
+
+每轮 `run_decision_cycle()` 的主流程：
+
+1. **交易时段检查**
+   - 非交易时段默认观望（除非手动 `force=True`）。
+
+2. **更新持仓价格（MCP 行情）**
+   - 对当前持仓调用行情 MCP 获取最新价并写回数据库。
+
+3. **智能体卖出复核（新增）**
+   - 使用 NotebookLM + 行情上下文，对每个持仓输出 `hold / partial / sell`。
+   - 仅当置信度达到 `agent.exit_review.min_confidence` 且满足 `can_sell`（T+1 + 锁仓）才执行。
+
+4. **规则兜底卖出**
+   - 再执行 `portfolio.process_exits()`：
+   - 包含硬止损、移动止盈、强制减仓、时间止损等规则。
+
+5. **买入决策**
+   - 当仓位与现金条件满足时，采集市场数据，让智能体输出买入决策。
+   - 仅当综合胜率 `>= trading.win_rate_threshold` 才买入。
+
+6. **记录快照与报告**
+   - 写入决策日志、MDA 快照，刷新 `reports/dashboard.html`。
+
+---
+
+## 6. 检索与推理逻辑（NotebookLM + 本地 RAG）
+
+### 6.1 主路径
+
+- 默认先走 NotebookLM（知识库主证据源）。
+- `multi-domain-foresight` 可在首轮证据不足时发起 NotebookLM 第二跳补全（gap fill）。
+
+### 6.2 本地 RAG 兜底
+
+当 NotebookLM 不可用时，回退到本地 RAG：
+
+- **two_stage**：粗召回 + 融合精排
+- **multihop**：多查询后缀检索 + 去重合并
+
+---
+
+## 7. 配置说明（`config.yaml`）
+
+### 7.1 交易参数（`trading`）
+
+- `initial_capital`：初始资金
+- `stop_loss`：基础止损比例（如 `-0.05`）
+- `partial_take_at_return`：达到该收益率触发强制减仓
+- `partial_take_ratio`：减仓比例
+- `win_rate_threshold`：买入阈值
+- `sell_lock_minutes`：买入后锁仓分钟数
+
+### 7.2 MCP（`mcp`）
+
+- `stock_server` / `ashare_server`：行情 MCP
+- `notebooklm_server` + `notebook_id`：NotebookLM MCP
+- `market_tool_candidates`：行情工具候选映射
+
+### 7.3 本地 RAG（`local_rag`）
+
+- `enabled`：是否启用本地 RAG
+- `two_stage.*`：两阶段检索参数
+- `multihop.*`：多跳检索参数
+
+### 7.4 Agent（`agent`）
+
+- `orchestrator_prompt` / `execution_prompt`：双提示词
+- `retrieval_protocol_prompt`：检索协议约束
+- `multihop.*`：NotebookLM 第二跳缺口补全阈值
+- `exit_review.enabled`：是否启用“每轮智能体卖出复核”
+- `exit_review.min_confidence`：卖出建议执行置信度下限
+
+---
+
+## 8. Web 模式（`web_app.py`）
+
+```bash
+python web_app.py
+```
+
+- 默认地址：`http://127.0.0.1:7860`
+- 支持连续问答、`Check/刷新` 手动触发一轮决策、看板展示
+- 注意：**Web 进程本身不是 live 轮询服务**，自动轮询仍以 `main.py --mode live` 为主
+
+---
+
+## 9. 报告与测试
+
+生成报告：
+
+```bash
 python report.py
 ```
 
-## 🧠 决策工作流
+运行测试：
 
-1. **定时触发**：`main.py` 每 5 分钟唤醒一次 `MCPAgent`。
-2. **状态更新**：系统调用 `stock-sdk-mcp` 更新所有持仓的当前价格，并由 `portfolio.py` 检查是否触发止盈、止损或最大持仓天数。如果触发，立即卖出并扣除印花税/佣金。
-3. **寻找机会**：若账户有可用资金，拉取当前大盘/关注池的行情摘要。
-4. **Agent 预判**：将行情摘要发给 `notebooklm-mcp`，智能体基于设定的知识库和人设，输出结构化的 JSON 选股决策（含目标价、止损价、买入理由）。
-5. **执行买入**：系统验证资金与信号有效性后，以 100 股为单位执行买入操作，并记录决策逻辑至 SQLite。
+```bash
+python test_system.py
+```
 
-## 📝 License
+---
+
+## License
 
 MIT License

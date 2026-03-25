@@ -1,21 +1,27 @@
 import logging
 import pandas as pd
 from datetime import datetime
-
+import yaml
 from portfolio import PortfolioManager
-
+from risk_gate import RiskGate
 
 class HistoricalBacktester:
-    def __init__(self, config: dict, config_path="config.yaml", db_path="quant_sim.db"):
-        self.config = config
-        self.backtest_cfg = config.get("backtest", {})
-        self.trading_cfg = config.get("trading", {})
+    def __init__(self, config_path="config.yaml", db_path="quant_sim.db"):
+        with open(config_path, "r", encoding="utf-8") as f:
+            self.config = yaml.safe_load(f)
+        self.backtest_cfg = self.config.get("backtest", {})
+        self.trading_cfg = self.config.get("trading", {})
         self.portfolio = PortfolioManager(config_path=config_path, db_path=db_path)
-        self.max_positions = int(self.trading_cfg.get("max_positions", 3))
+        self.risk_gate = RiskGate(self.config)
 
     def _load_data(self) -> pd.DataFrame:
         data_file = self.backtest_cfg.get("data_file", "data/historical_quotes.csv")
-        df = pd.read_csv(data_file)
+        try:
+            df = pd.read_csv(data_file)
+        except FileNotFoundError:
+            logging.error(f"找不到历史行情文件: {data_file}")
+            return pd.DataFrame()
+            
         required_cols = {"date", "symbol", "name", "close"}
         missing = required_cols - set(df.columns)
         if missing:
@@ -59,7 +65,7 @@ class HistoricalBacktester:
     def run(self):
         df = self._load_data()
         if df.empty:
-            logging.warning("历史行情数据为空，跳过回测。")
+            logging.warning("历史行情数据为空或加载失败，跳过回测。")
             return
 
         position_pct = float(self.backtest_cfg.get("position_pct", 0.3))
@@ -68,34 +74,36 @@ class HistoricalBacktester:
 
         all_days = sorted(df["date"].dt.date.unique())
         for day in all_days:
+            # 模拟收盘前 5 分钟决策
             now = datetime.combine(day, datetime.min.time()).replace(hour=14, minute=55)
             day_slice = df[df["date"].dt.date == day]
             day_prices = {r["symbol"]: float(r["close"]) for _, r in day_slice.iterrows()}
 
+            # 1. 更新价格并处理卖出
             self.portfolio.update_market_prices(day_prices)
             exit_actions = self.portfolio.process_exits(now=now)
             for action in exit_actions:
-                logging.info(
-                    "回测触发%s: %s %s, 原因: %s",
-                    action["action"],
-                    action["symbol"],
-                    action["name"],
-                    action["reason"],
-                )
+                logging.info(f"回测触发{action['action']}: {action['symbol']} {action['name']}, 原因: {action['reason']}")
 
+            # 2. 检查买入门禁
             positions = self.portfolio.db.get_positions()
-            if len(positions) >= self.max_positions:
+            blocked_reason = self.risk_gate.buy_blocked_reason(None, len(positions))
+            if blocked_reason:
                 continue
 
+            # 3. 现金比例门禁
             account = self.portfolio.account
-            if account["balance"] <= account["total_assets"] * 0.2:
+            min_cash_ratio = self.risk_gate.min_cash_ratio_to_scan()
+            if account["balance"] <= account["total_assets"] * min_cash_ratio:
                 continue
 
+            # 4. 寻找候选标的
             history_window = df[df["date"].dt.date <= day]
             candidate = self._pick_candidate(history_window, day_slice)
             if not candidate:
                 continue
 
+            # 5. 执行买入
             current_price = candidate["price"]
             target_price = current_price * (1 + target_return)
             stop_loss_price = current_price * (1 - stop_loss_pct)

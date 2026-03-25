@@ -3,8 +3,7 @@ from database import Database
 from datetime import datetime, timedelta
 import logging
 import math
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import utils
 
 class PortfolioManager:
     def __init__(self, config_path="config.yaml", db_path="quant_sim.db"):
@@ -61,11 +60,15 @@ class PortfolioManager:
         """
         if now is None:
             now = datetime.now()
+        
+        # 基础 T+1 检查
         bought_at = datetime.fromisoformat(position["bought_at"])
-        lock_status = self.get_lock_status(position, now=now)
-        if lock_status["is_locked"]:
+        if now.date() <= bought_at.date():
             return False
-        return now.date() > bought_at.date()
+            
+        # 锁仓时间检查
+        lock_status = self.get_lock_status(position, now=now)
+        return not lock_status["is_locked"]
 
     def refresh_position_risk(self, position):
         current_price = float(position["current_price"])

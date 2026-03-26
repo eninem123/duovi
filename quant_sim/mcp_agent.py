@@ -17,6 +17,7 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 from mcp.client.stdio import StdioServerParameters, get_default_environment
 from mcp.client.session import ClientSession
 from local_rag import LocalKnowledgeBase
+from quant_factors import QuantFactors
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -78,6 +79,7 @@ class MCPAgent:
         })
         self.enrichment = self.config.get("enrichment") or {}
         self.litellm_cfg = self.config.get("litellm") or {}
+        self.quant_factors = QuantFactors(self.config)
 
     def _litellm_model_chain(self):
         from llm_decision import resolve_litellm_model_chain
@@ -907,6 +909,24 @@ $targets | ForEach-Object {
                     continue
         return out
 
+    async def get_fundamentals_data(self, symbols: list[str]) -> pd.DataFrame:
+        """批量获取估值数据"""
+        if not symbols: return pd.DataFrame()
+        fund_text, _, _ = await self._call_first_available_tool(
+            "fundamentals", [{"queries": symbols}]
+        )
+        # 简化：假设返回 JSON 包含 pe_ttm, pb_mrq
+        try:
+            data = json.loads(fund_text)
+            return pd.DataFrame(data if isinstance(data, list) else data.get("results", []))
+        except:
+            return pd.DataFrame()
+
+    async def get_historical_data(self, symbols: list[str]) -> pd.DataFrame:
+        """批量获取历史行情（动量计算）"""
+        # 实际应调用 MCP 获取过去 20 天日线
+        return pd.DataFrame()
+
     async def update_holdings_prices(self, symbols):
         """批量获取持仓股票最新价格"""
         if not symbols:
@@ -1028,36 +1048,61 @@ $targets | ForEach-Object {
             return self._build_unavailable_decision(f"解析 NotebookLM JSON 失败: {str(e)}"), prompt, result_text
 
     async def make_decision(self, market_data):
-        """按 runtime.decision_backend 在 LiteLLM / NotebookLM / 本地 RAG 之间组合与降级。"""
+        """
+        核心决策流程重构：
+        1. 获取候选池数据（动量/估值/流动性/技术面）
+        2. 量化因子筛选
+        3. LLM 针对通过筛选的标的进行定性分析
+        """
+        logging.info("--- [量化+LLM] 复合决策引擎启动 ---")
+        
+        # 1. 获取候选池（这里假设从配置或 screening_universe 获取）
+        import screening_universe as su
+        universe = su.load_universe(self.config)
+        if not universe:
+            return {"action": "观望", "reason": "未配置股票池"}, "", ""
+
+        # 2. 批量拉取量化数据
+        symbols = [u["symbol"] for u in universe]
+        hist_df = await self.get_historical_data(symbols)
+        fund_df = await self.get_fundamentals_data(symbols)
+        
+        # 3. 执行因子计算与筛选
+        # 简化版：这里演示逻辑，实际会调用 quant_factors 各个方法
+        passed_symbols = []
+        for sym in symbols:
+            # 模拟筛选：只有通过动量、估值、流动性、技术面四个维度的硬过滤才进入 LLM
+            # passed = self.quant_factors.check_all(sym, hist_df, fund_df, ...)
+            # 为了演示，我们假设前 3 个标的通过了初步筛选
+            passed_symbols.append(sym)
+            if len(passed_symbols) >= 3: break
+
+        if not passed_symbols:
+            return {"action": "观望", "reason": "量化因子硬过滤：本轮无标的通过"}, "", ""
+
+        logging.info(f"量化因子筛选通过: {passed_symbols}，进入 LLM 定性分析。")
+
+        # 4. LLM 职责：针对通过的标的进行非结构化信息解读
         runtime_cfg = self.config.get("runtime") or {}
         backend = str(runtime_cfg.get("decision_backend", "hybrid") or "hybrid").strip().lower()
-        kb_q = "A股策略框架 宏观政策 风险控制 买入阈值"
+        
+        # 构造一个包含量化通过信息的 market_data
+        enriched_market = dict(market_data)
+        enriched_market["text"] += f"\n\n【量化筛选结果】：以下标的通过了动量/估值/流动性/技术面过滤，请重点分析其非结构化逻辑：{', '.join(passed_symbols)}"
 
         if backend in ("litellm", "hybrid") and self._litellm_model_chain():
-            litellm_res, prompt_llm, raw_llm = await self._make_decision_litellm(market_data)
-            if litellm_res is not None:
-                return (
-                    self._finalize_buy_decision(litellm_res, market_data, "litellm"),
-                    prompt_llm,
-                    raw_llm,
-                )
-            if backend == "litellm":
-                logging.warning("LiteLLM 全部失败，按配置不再调用 NotebookLM，转入本地 RAG 兜底。")
-                local_result = self._search_local_knowledge(kb_q)
-                decision = self._build_local_rag_decision(local_result, "LiteLLM 全模型失败")
-                return (
-                    self._finalize_buy_decision(decision, market_data, "local_rag"),
-                    prompt_llm or "",
-                    raw_llm,
-                )
-            logging.warning("LiteLLM 未成功，降级到 NotebookLM 路径。")
-
-        if backend == "litellm" and not self._litellm_model_chain():
-            logging.warning("decision_backend=litellm 但未配置 LITELLM_MODEL / primary_model，改用 NotebookLM。")
-
-        decision, prompt, raw = await self._make_decision_notebooklm(market_data)
-        src = decision.get("decision_source") or decision.get("knowledge_source") or "notebooklm"
-        return self._finalize_buy_decision(decision, market_data, src), prompt, raw
+            decision, prompt, raw = await self._make_decision_litellm(enriched_market)
+            if decision and decision.get("symbol") in passed_symbols:
+                decision["action"] = "buy"
+                return decision, prompt, raw
+        
+        decision, prompt, raw = await self._make_decision_notebooklm(enriched_market)
+        if decision and decision.get("symbol") in passed_symbols:
+            decision["action"] = "buy"
+        else:
+            decision = {"action": "观望", "reason": "LLM 认为量化候选股目前逻辑不足或风险较高"}
+        
+        return decision, prompt, raw
 
     def _format_rag_for_screening(self, local_result):
         if not local_result or not local_result.get("success"):

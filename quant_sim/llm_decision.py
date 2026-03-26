@@ -59,12 +59,11 @@ def decision_json_instruction() -> str:
 {
   "symbol": "6位A股代码如 600519；无合适标的填 null",
   "name": "股票简称，可为空字符串",
-  "win_rate_confidence": 0.0,
-  "dimension_scores": {
-    "data_arch": 0,
-    "notebooklm": 0,
-    "game_psych": 0,
-    "trend": 0
+  "qualitative_analysis": {
+    "fundamental_outlook": "",
+    "catalyst_potential": "",
+    "risk_factors": "",
+    "market_sentiment": ""
   },
   "reason": "一句话结论",
   "target_price": null,
@@ -80,8 +79,7 @@ def decision_json_instruction() -> str:
   "deviation_analysis": "实时盘面/新闻相对知识库要点或纪律阈值的偏离，可简写；无则空字符串",
   "confidence_rationale": "用一两句话说明胜率估计依据（知识库+盘面），勿编造未给出的数据"
 }
-dimension_scores 四项各 0-25 分整数；win_rate_confidence 为 0-1 小数，可与四分之和/100 一致。
-若无合格买点，symbol 置为 null，win_rate_confidence 取低分并说明原因。
+qualitative_analysis 字段用于 LLM 对股票进行定性分析，不再包含胜率和评分。若无合格买点，symbol 置为 null，并说明原因。
 """.strip()
 
 
@@ -92,18 +90,12 @@ def normalize_structured_decision(decision: dict[str, Any] | None) -> dict[str, 
     d: dict[str, Any] = dict(decision) if isinstance(decision, dict) else {}
     d.setdefault("intent_module", "MDA_execution")
     d.setdefault("deviation_analysis", "")
-    d.setdefault("confidence_rationale", "")
+    d.setdefault("qualitative_analysis", {})
     d.setdefault("knowledge_evidence_bundle", {})
     d.setdefault("execution_audit", {})
     now_iso = datetime.now(timezone.utc).isoformat()
     d.setdefault("evidence_as_of", now_iso)
-    if not (d.get("confidence_rationale") or "").strip():
-        ts = d.get("total_score")
-        wr = d.get("win_rate_confidence")
-        ks = d.get("knowledge_source") or d.get("decision_source") or "unknown"
-        d["confidence_rationale"] = (
-            f"四维合计分约 {ts}，综合胜率估计 {wr}；决策来源 {d.get('decision_source', '')}；知识源 {ks}。"
-        ).strip()
+
     ea = d["execution_audit"]
     if isinstance(ea, dict):
         ea.setdefault("evidence_as_of", d.get("evidence_as_of"))

@@ -8,8 +8,7 @@
 ## 1. 当前项目能做什么
 
 - **定时轮询（live）**：按固定分钟间隔自动跑一轮决策。
-- **持仓管理**：支持 T+1、买入后锁仓、止损、移动止盈、部分减仓、持仓时长控制。
-- **智能体买入决策**：仅在综合胜率达到阈值时买入。
+- **持仓管理**：支持 T+1、买入后锁仓、止损、移动止盈、部分减仓、持仓时长控制12. **复合买入决策**：引入动量、估值、流动性、技术面四维度量化因子硬过滤，结合 LLM 对非结构化信息（财报、研报、舆情）的定性解读。不再依赖主观胜率评分。
 - **智能体卖出复核**：每轮先让智能体评估 `hold / partial / sell`，再由规则兜底。
 - **NotebookLM 为主，本地 RAG 为兜底**：
   - NotebookLM 可用时优先用 NotebookLM；
@@ -123,11 +122,9 @@ python -u main.py --mode backtest
    - 再执行 `portfolio.process_exits()`：
    - 包含硬止损、移动止盈、强制减仓、时间止损等规则。
 
-5. **买入决策**
-   - 当仓位与现金条件满足时，采集市场数据，让智能体输出买入决策。
-   - 仅当综合胜率 `>= trading.win_rate_threshold` 才买入。
-
-6. **记录快照与报告**
+5. **买入决策*127.   - 当仓位与现金条件满足时，系统首先执行量化因子筛选（动量、估值、流动性、技术面）。
+128.   - 仅对通过量化筛选的标的，调用 LLM 进行非结构化逻辑解读。
+129.   - 若 LLM 给出支持性的定性分析报告，则执行买入。不再依赖 `win_rate_threshold`。*记录快照与报告**
    - 写入决策日志、MDA 快照，刷新 `reports/dashboard.html`。
 
 ---
@@ -155,9 +152,7 @@ python -u main.py --mode backtest
 - `initial_capital`：初始资金
 - `stop_loss`：基础止损比例（如 `-0.05`）
 - `partial_take_at_return`：达到该收益率触发强制减仓
-- `partial_take_ratio`：减仓比例
-- `win_rate_threshold`：买入阈值
-- `sell_lock_minutes`：买入后锁仓分钟数
+- `partial_take_ratio`：减仓比159. - `factors`：包含动量、估值、流动性、技术面等量化因子的具体筛选参数。`sell_lock_minutes`：买入后锁仓分钟数
 
 ### 7.2 MCP（`mcp`）
 

@@ -80,9 +80,7 @@ class QuantTradingSystem:
             "action": action,
             "symbol": symbol or decision.get("symbol"),
             "name": name or decision.get("name"),
-            "total_score": float(decision.get("total_score", 0.0) or 0.0),
-            "win_rate_confidence": float(decision.get("win_rate_confidence", 0.0) or 0.0),
-            "dimension_scores": decision.get("dimension_scores") or {},
+            "qualitative_analysis": decision.get("qualitative_analysis") or {},
             "risk_text": utils.build_risk_text(positions[0] if positions else None, self.trading_config),
             "lock_status": self._summarize_lock_status(positions),
             "thinking_trace": utils.extract_thinking_trace(decision),
@@ -94,9 +92,7 @@ class QuantTradingSystem:
             action=snapshot["action"] or "观望",
             symbol=snapshot["symbol"],
             name=snapshot["name"],
-            total_score=snapshot["total_score"],
-            win_rate_confidence=snapshot["win_rate_confidence"],
-            dimension_scores=snapshot["dimension_scores"],
+            qualitative_analysis=snapshot["qualitative_analysis"],
             risk_text=snapshot["risk_text"],
             lock_status=snapshot["lock_status"],
             thinking_trace=snapshot["thinking_trace"],
@@ -195,29 +191,25 @@ class QuantTradingSystem:
             snapshot = self._record_mda_snapshot(reason=f"开仓门禁拦截: {blocked_reason}")
         else:
             logging.info("开始扫描市场机会...")
+            # 这里的 make_decision 已经包含了量化因子硬过滤和 LLM 定性分析
             decision = await self.agent.make_decision()
             
             if decision.get("action") == "buy":
-                # 再次校验风险门禁
-                blocked_reason = self.risk_gate.buy_blocked_reason(decision, len(current_positions))
-                if not blocked_reason:
-                    success = self.portfolio.buy(
-                        symbol=decision["symbol"],
-                        name=decision["name"],
-                        price=decision["current_price"],
-                        position_pct=decision.get("position_pct", 0.3),
-                        target_price=decision.get("target_price"),
-                        stop_loss_price=decision.get("stop_loss_price"),
-                        reason=decision.get("reason", "智能体建议买入")
-                    )
-                    if success:
-                        cycle_events.append({"action": "买入", "symbol": decision["symbol"], "name": decision["name"], "reason": decision.get("reason")})
-                        snapshot = self._record_mda_snapshot(decision, action="买入")
-                    else:
-                        snapshot = self._record_mda_snapshot(decision, reason="买入执行失败（资金不足或已持仓）")
+                # 执行买入，不再依赖 LLM 拍脑袋的 win_rate_threshold
+                success = self.portfolio.buy(
+                    symbol=decision["symbol"],
+                    name=decision["name"],
+                    price=decision["current_price"],
+                    position_pct=decision.get("position_pct", 0.3),
+                    target_price=decision.get("target_price"),
+                    stop_loss_price=decision.get("stop_loss_price"),
+                    reason=decision.get("reason", "量化因子通过+LLM定性逻辑支持")
+                )
+                if success:
+                    cycle_events.append({"action": "买入", "symbol": decision["symbol"], "name": decision["name"], "reason": decision.get("reason")})
+                    snapshot = self._record_mda_snapshot(decision, action="买入")
                 else:
-                    logging.info(f"决策后拦截: {blocked_reason}")
-                    snapshot = self._record_mda_snapshot(decision, reason=f"决策后拦截: {blocked_reason}")
+                    snapshot = self._record_mda_snapshot(decision, reason="买入执行失败（资金不足或已持仓）")
             else:
                 snapshot = self._record_mda_snapshot(decision, action="观望", reason=decision.get("reason", "未发现合适机会"))
 

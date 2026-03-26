@@ -6,10 +6,24 @@ trading:
   sell_lock_minutes: 30       # 买入后 30 分钟内禁止卖出
   commission_rate: 0.0003     # 佣金费率 万三
   stamp_duty: 0.0005          # 印花税率 万五（仅卖出收取）
-  win_rate_threshold: 0.75    # 仅当综合胜率 >= 75% 时执行买入
+
   trail_arm_pct: 0.10         # 达到 +10% 后启动移动止盈
   trail_floor_pct: 0.05       # 移动止盈抬升到 +5%
   partial_take_at_return: 0.15
+
+factors:
+  momentum:
+    lookback_days: [5, 10, 20]
+    min_rank_percentile: 70  # 只买动量前 30%
+  valuation:
+    pe_percentile_max: 60   # 估值不超过历史 60 分位
+    pb_percentile_max: 50
+  liquidity:
+    min_avg_turnover_20d: 50000000  # 日均成交>5000 万
+    max_bid_ask_spread_pct: 0.005
+  technical:
+    ma_trend_aligned: true    # 均线多头排列
+    volume_ratio_min: 1.5     # 当日量比>1.5
   partial_take_ratio: 0.50
 
 # 交易循环门禁（main.run_decision_cycle）；与 agent 提示词中的纪律相互独立，便于调参
@@ -145,13 +159,7 @@ agent:
     4. 买入后 30 分钟内禁止任何卖出动作。
     5. 止损规则：现价 <= 持仓均价 × 0.95 时，若满足 T+1 与锁仓，则下个周期强制清仓。
     6. 止盈规则：达到 +10% 后开启移动止盈，将防守线提升至 +5%；达到 +15% 时强制减仓 50%。
-    7. 只有当综合胜率 P >= 75% 时才允许建议买入。
-
-    每次执行判断必须从以下四个维度评分，每项 0-25 分：
-    1. 数据架构维度：实时单量、PE/PB、KDJ/MACD、盘口与成交特征。
-    2. 知识库维度：知识库中的研报逻辑、支撑位/阻力位、政策催化匹配度。
-    3. 博弈心理维度：板块热度、大单资金净流向、情绪与筹码博弈。
-    4. 趋势动能维度：分时走势、量价配合、强弱切换、延续性。
+    7. 不再直接判断综合胜率或进行维度评分，而是专注于对通过量化筛选的股票进行深度定性分析，识别其基本面、催化剂、风险点和市场情绪。
 
     如果没有任何符合条件的机会，必须返回观望，不允许硬凑交易。
 

@@ -1,8 +1,8 @@
 trading:
   initial_capital: 100000.0   # 初始资金10万元
-  target_return: 0.15         # 目标收益率 15%
-  stop_loss: -0.05            # 止损阈值 -5%
-  max_holding_days: 15        # 最大持仓天数 15天
+  target_return: 0.15         # 恢复
+  stop_loss: -0.05            # 恢复
+  max_holding_days: 15        # 恢复大持仓天数 (微调：缩短周期)
   sell_lock_minutes: 30       # 买入后 30 分钟内禁止卖出
   commission_rate: 0.0003     # 佣金费率 万三
   stamp_duty: 0.0005          # 印花税率 万五（仅卖出收取）
@@ -58,9 +58,9 @@ backtest:
   data_file: "data/historical_quotes_5y.csv"  # 历史行情CSV文件
   start_date: "2018-01-01"
   end_date: "2024-12-31"
-  lookback_days: 20           # 动量回看窗口
-  min_momentum: 0.05          # 入场最小动量阈值(5%)
-  position_pct: 0.3           # 单笔仓位
+  lookback_days: 20           # 恢复
+  min_momentum: 0.08          # 保持较高过滤
+  position_pct: 0.2           # 保持分散仓位
 
 mcp:
   stock_server:

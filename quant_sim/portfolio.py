@@ -3,7 +3,8 @@ from database import Database
 from datetime import datetime, timedelta
 import logging
 import math
-import utils
+import pandas as pd
+import numpy as np
 
 class PortfolioManager:
     def __init__(self, config_path="config.yaml", db_path="quant_sim.db"):
@@ -12,10 +13,14 @@ class PortfolioManager:
         
         self.db = Database(db_path)
         self.trading_config = self.config["trading"]
+        self.position_sizing_config = self.config.get("position_sizing", {})
+        self.market_regime_config = self.config.get("market_regime_filter", {})
         
         # Initialize account
         self.account = self.db.get_account(self.trading_config["initial_capital"])
         self.sync_total_assets()
+        
+        self.market_regime = "range_bound" # Default market regime
 
     def sync_total_assets(self):
         """同步计算总资产（现金 + 股票市值）"""
@@ -36,6 +41,51 @@ class PortfolioManager:
             if sym in market_data_dict:
                 self.db.update_position_price(sym, market_data_dict[sym])
         self.sync_total_assets()
+
+    def set_market_regime(self, regime):
+        self.market_regime = regime
+
+    def _get_current_total_position_cap(self):
+        """根据市场状态获取当前总仓位上限"""
+        if not self.market_regime_config.get("enabled", False):
+            return 1.0 # 如果未启用市场状态过滤，则默认为100%仓位
+
+        if self.market_regime == "bull":
+            return self.market_regime_config.get("bull_position_cap", 1.0)
+        elif self.market_regime == "bear":
+            return self.market_regime_config.get("bear_position_cap", 0.3)
+        elif self.market_regime == "range_bound":
+            return self.market_regime_config.get("range_bound_position_cap", 0.6)
+        return 1.0 # 默认
+
+    def _calculate_position_size(self, symbol, price):
+        """计算单个股票的仓位大小"""
+        total_assets = self.account["total_assets"]
+        current_total_position_cap = self._get_current_total_position_cap()
+        current_positions = self.db.get_positions()
+        current_positions_value = sum(p["quantity"] * p["current_price"] for p in current_positions)
+
+        # 可用于新开仓的最大资金 (考虑总仓位上限)
+        max_investable_capital_overall = total_assets * current_total_position_cap - current_positions_value
+        if max_investable_capital_overall <= 0:
+            return 0
+
+        # 单票上限
+        max_single_position_pct = self.position_sizing_config.get("max_single_position", 0.25)
+        max_single_position_value = total_assets * max_single_position_pct
+        
+        # 简化为：每次买入不超过单票上限，且不超过总仓位上限允许的剩余空间
+        intended_amount = min(max_investable_capital_overall, max_single_position_value)
+        
+        # 确保买入金额不超过可用现金
+        intended_amount = min(intended_amount, self.account["balance"])
+
+        if intended_amount <= 0:
+            return 0
+            
+        # A股买入必须是100股的整数倍
+        quantity = int(intended_amount / price // 100 * 100)
+        return quantity
 
     def get_lock_status(self, position, now=None):
         if now is None:
@@ -131,7 +181,7 @@ class PortfolioManager:
 
         return False, None
 
-    def buy(self, symbol, name, price, position_pct, target_price, stop_loss_price, reason, trade_time=None):
+    def buy(self, symbol, name, price, reason, trade_time=None):
         """执行买入操作"""
         # 检查是否已持仓
         positions = {p["symbol"]: p for p in self.db.get_positions()}
@@ -139,19 +189,11 @@ class PortfolioManager:
             logging.warning(f"[{symbol}] 已在持仓中，跳过买入。")
             return False
 
-        # 计算可用资金与买入数量
-        available_cash = self.account["balance"]
-        total_assets = self.account["total_assets"]
-        
-        # 按总资产的比例计算打算买入的金额
-        intended_amount = total_assets * position_pct
-        if intended_amount > available_cash:
-            intended_amount = available_cash
-            
-        # A股买入必须是100股的整数倍
-        quantity = int(intended_amount / price // 100 * 100)
+        # 计算建议买入数量
+        quantity = self._calculate_position_size(symbol, price)
+
         if quantity == 0:
-            logging.warning(f"[{symbol}] 可用资金不足以买入100股。")
+            logging.warning(f"[{symbol}] 仓位管理限制，无法买入。")
             return False
 
         # 计算费用（买入只有佣金，无印花税）
@@ -160,10 +202,11 @@ class PortfolioManager:
         commission = max(commission, 5.0)
         total_cost = price * quantity + commission
 
-        if total_cost > available_cash:
-            # 重新调整数量
-            quantity -= 100
+        if total_cost > self.account["balance"]:
+            # 重新调整数量以适应可用资金
+            quantity = int((self.account["balance"] - 5) / price // 100 * 100) # 预留5元佣金
             if quantity <= 0:
+                logging.warning(f"[{symbol}] 可用资金不足以买入100股。")
                 return False
             commission = max(price * quantity * self.trading_config["commission_rate"], 5.0)
             total_cost = price * quantity + commission
@@ -173,7 +216,10 @@ class PortfolioManager:
         trade_timestamp = trade_time.isoformat() if trade_time else None
         self.db.execute_trade(symbol, name, "BUY", price, quantity, commission, reason, timestamp=trade_timestamp)
         self.db.update_position(
-            symbol, name, quantity, price, price, target_price, stop_loss_price, bought_at=trade_timestamp
+            symbol, name, quantity, price, price, 
+            self.trading_config.get("target_return", 0.15), 
+            self.trading_config.get("stop_loss", -0.05), 
+            bought_at=trade_timestamp
         )
         self.sync_total_assets()
         

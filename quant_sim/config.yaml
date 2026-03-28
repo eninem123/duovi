@@ -54,13 +54,25 @@ litellm:
   fallback_models: []        # 也可在环境变量 LITELLM_FALLBACK_MODELS 中用逗号分隔多个模型
   timeout_seconds: 90
 
+position_sizing:
+  base_method: "kelly_criterion" # 凯利公式或固定分数法
+  max_single_position: 0.25    # 单票上限 25%
+  max_sector_exposure: 0.40    # 单行业上限 40%
+  correlation_limit: 0.7       # 持仓间相关性不超过 0.7
+
+market_regime_filter:
+  enabled: true
+  bull_position_cap: 1.0       # 牛市满仓
+  bear_position_cap: 0.3       # 熊市最多 3 成
+  range_bound_position_cap: 0.6 # 震荡市 6 成
+
 backtest:
   data_file: "data/historical_quotes_5y.csv"  # 历史行情CSV文件
   start_date: "2018-01-01"
   end_date: "2024-12-31"
   lookback_days: 20           # 恢复
   min_momentum: 0.08          # 保持较高过滤
-  position_pct: 0.2           # 保持分散仓位
+  # position_pct: 0.2           # 保持分散仓位 (由 position_sizing 动态计算)
 
 mcp:
   stock_server:

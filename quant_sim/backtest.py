@@ -84,6 +84,35 @@ class HistoricalBacktester:
         candidates.sort(key=lambda x: x["momentum"], reverse=True)
         return candidates[0]
 
+    def _detect_market_regime(self, current_date: datetime, benchmark_df: pd.DataFrame) -> str:
+        """根据基准指数表现判断市场状态"""
+        if benchmark_df.empty:
+            return "range_bound"
+
+        # 考虑过去一段时间的基准收益率
+        lookback_period = 60  # 例如，看过去60天的表现
+        start_date = current_date - timedelta(days=lookback_period)
+        recent_benchmark = benchmark_df[(benchmark_df["date"] >= start_date) & (benchmark_df["date"] <= current_date)]
+
+        if len(recent_benchmark) < lookback_period / 2:
+            return "range_bound"
+
+        # 计算这段时间的累计收益率
+        initial_price = recent_benchmark.iloc[0]["close"]
+        final_price = recent_benchmark.iloc[-1]["close"]
+        cumulative_return = (final_price / initial_price) - 1
+
+        # 简单判断：
+        # 牛市：累计收益率 > 5%
+        # 熊市：累计收益率 < -5%
+        # 震荡市：介于两者之间
+        if cumulative_return > 0.05:
+            return "bull"
+        elif cumulative_return < -0.05:
+            return "bear"
+        else:
+            return "range_bound"
+
     def run(self):
         df = self._load_data()
         benchmark_df = self._load_benchmark()
@@ -91,7 +120,6 @@ class HistoricalBacktester:
             logging.warning("历史行情数据为空，跳过回测。")
             return
 
-        position_pct = float(self.backtest_cfg.get("position_pct", 0.3))
         target_return = float(self.trading_cfg.get("target_return", 0.15))
         stop_loss_pct = abs(float(self.trading_cfg.get("stop_loss", -0.05)))
         
@@ -105,7 +133,11 @@ class HistoricalBacktester:
             day_slice = df[df["date"].dt.date == day]
             day_prices = {r["symbol"]: float(r["close"]) for _, r in day_slice.iterrows()}
 
-            # 1. 更新价格并处理卖出
+            # 1. 更新市场状态
+            market_regime = self._detect_market_regime(now, benchmark_df)
+            self.portfolio.set_market_regime(market_regime)
+
+            # 2. 更新价格并处理卖出
             self.portfolio.update_market_prices(day_prices)
             
             # 模拟卖出滑点
@@ -117,7 +149,7 @@ class HistoricalBacktester:
             
             exit_actions = self.portfolio.process_exits(now=now)
             
-            # 2. 记录每日资产
+            # 3. 记录每日资产
             acc = self.portfolio.db.get_account()
             self.equity_curve.append({
                 "date": day,
@@ -133,18 +165,18 @@ class HistoricalBacktester:
                     "close": b_val.iloc[0]["close"]
                 })
 
-            # 3. 检查买入门禁
+            # 4. 检查买入门禁
             positions = self.portfolio.db.get_positions()
             if self.risk_gate.buy_blocked_reason(None, len(positions)):
                 continue
 
-            # 4. 寻找候选标的
+            # 5. 寻找候选标的
             history_window = df[df["date"].dt.date <= day]
             candidate = self._pick_candidate(history_window, day_slice)
             if not candidate:
                 continue
 
-            # 5. 执行买入（含滑点）
+            # 6. 执行买入（含滑点），position_pct 不再直接传递
             buy_price = candidate["price"] * (1 + slippage)
             target_price = buy_price * (1 + target_return)
             stop_loss_price = buy_price * (1 - stop_loss_pct)
@@ -153,9 +185,6 @@ class HistoricalBacktester:
                 symbol=candidate["symbol"],
                 name=candidate["name"],
                 price=buy_price,
-                position_pct=position_pct,
-                target_price=target_price,
-                stop_loss_price=stop_loss_price,
                 reason=f"Momentum {candidate['momentum']:.2%}",
                 trade_time=now,
             )

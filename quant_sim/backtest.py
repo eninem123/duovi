@@ -167,7 +167,11 @@ class HistoricalBacktester:
 
             # 4. 检查买入门禁
             positions = self.portfolio.db.get_positions()
-            if self.risk_gate.buy_blocked_reason(None, len(positions)):
+            # 模拟 NotebookLM 和 local_rag 都失败，降级到 pure_quant 决策
+            mock_decision = {"decision_source": "pure_quant", "success": True}
+            buy_blocked_reason = self.risk_gate.buy_blocked_reason(mock_decision, len(positions))
+            if buy_blocked_reason:
+                logging.info(f"[{day.strftime('%Y-%m-%d')}] 阻止买入: {buy_blocked_reason}")
                 continue
 
             # 5. 寻找候选标的
@@ -178,8 +182,6 @@ class HistoricalBacktester:
 
             # 6. 执行买入（含滑点），position_pct 不再直接传递
             buy_price = candidate["price"] * (1 + slippage)
-            target_price = buy_price * (1 + target_return)
-            stop_loss_price = buy_price * (1 - stop_loss_pct)
             
             self.portfolio.buy(
                 symbol=candidate["symbol"],

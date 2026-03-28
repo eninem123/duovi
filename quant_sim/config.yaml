@@ -31,14 +31,14 @@ risk_gate:
   max_positions: 5              # 同时持仓上限
   min_cash_ratio_to_scan: 0.05  # 可用现金 > 总资产×该比例时才扫描买入
   block_buy_on_kb_unavailable: false  # 回测时关闭
-  require_notebooklm_for_buy: false   # 回测时关闭
+  require_notebooklm_for_buy: true   # 默认启用 NotebookLM 门禁
 
 runtime:
   mode: "live"                # live: 实盘模拟循环 / backtest: 历史行情回测
   # 决策后端: hybrid = LiteLLM 优先，失败则 NotebookLM，再失败由 NotebookLM 内逻辑走本地 RAG
   # litellm = 仅 LiteLLM，失败后直接本地 RAG；notebooklm = 保持原 NotebookLM 主路径
   # 与 risk_gate.require_notebooklm_for_buy 同时启用时请用 notebooklm，否则买入扫描可能被 LiteLLM 永远抢先而无法开仓
-  decision_backend: "notebooklm"
+  decision_backend: "hybrid" # hybrid: NotebookLM 优先，失败则本地 RAG，再失败纯量化
 
 enrichment:
   tushare_enabled: true
@@ -182,6 +182,19 @@ agent:
     - theme：行业轮动/政策催化，结合新闻、历史规律和当前资金风格。
     - discipline：心态管理/纪律重申，弱化短期波动，强调纪律与历史复盘。
     - opportunity：跨领域机会挖掘，优先识别被忽略的细节、异常点与重估路径。
+
+llm_decision_flow:
+  primary_llm: "notebooklm" # primary_llm: notebooklm, litellm
+  fallback_llm: "local_rag" # fallback_llm: local_rag, pure_quant
+  pure_quant_fallback_enabled: true # 是否在所有 LLM 失败后回退到纯量化模式
+
+knowledge_base_update:
+  enabled: true
+  update_frequency: "daily" # daily, weekly, monthly
+  sources:
+    - "akshare_news"
+    - "tushare_research"
+  embedding_model: "BAAI/bge-small-zh-v1.5"
 
   # 长上下文检索 + 多跳推理协议（参考 MSA：分层检索与迭代补全，主证据源仍为 NotebookLM + 本地 RAG）
   retrieval_protocol_prompt: |

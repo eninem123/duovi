@@ -6,7 +6,8 @@ import threading
 
 class Database:
     def __init__(self, db_path="quant_sim.db"):
-        self.db_path = db_path
+        script_dir = os.path.dirname(__file__)
+        self.db_path = os.path.join(script_dir, db_path)
         self._local = threading.local()
         self.init_db()
 

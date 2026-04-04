@@ -1,5 +1,5 @@
 import yaml
-from database import Database
+from .database import Database
 from datetime import datetime, timedelta
 import logging
 import math
@@ -8,7 +8,9 @@ import numpy as np
 
 class PortfolioManager:
     def __init__(self, config_path="config.yaml", db_path="quant_sim.db"):
-        with open(config_path, "r", encoding="utf-8") as f:
+        script_dir = os.path.dirname(__file__)
+        config_full_path = os.path.join(script_dir, config_path)
+        with open(config_full_path, "r", encoding="utf-8") as f:
             self.config = yaml.safe_load(f)
         
         self.db = Database(db_path)

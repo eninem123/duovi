@@ -31,7 +31,7 @@ risk_gate:
   max_positions: 5              # 同时持仓上限
   min_cash_ratio_to_scan: 0.05  # 可用现金 > 总资产×该比例时才扫描买入
   block_buy_on_kb_unavailable: false  # 回测时关闭
-  require_notebooklm_for_buy: true   # 默认启用 NotebookLM 门禁
+  require_notebooklm_for_buy: false   # 默认启用 NotebookLM 门禁
 
 runtime:
   mode: "live"                # live: 实盘模拟循环 / backtest: 历史行情回测

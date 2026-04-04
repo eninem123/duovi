@@ -1,300 +1,316 @@
-import logging
+import yaml
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import yaml
-import os
 from datetime import datetime, timedelta
-from portfolio import PortfolioManager
-from risk_gate import RiskGate
+import logging
+import os
 
-# 设置日志
+from quant_sim.portfolio import PortfolioManager
+from quant_sim.risk_gate import RiskGate
+from quant_sim.update_kb import main as update_kb_main, KnowledgeBaseUpdater
+
+# 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class HistoricalBacktester:
-    def __init__(self, config_path="config.yaml", db_path="backtest.db"):
-        if os.path.exists(db_path):
-            os.remove(db_path) # 每次回测前清理旧数据库
-            
-        with open(config_path, "r", encoding="utf-8") as f:
+    def __init__(self, config_path="config.yaml"):
+        script_dir = os.path.dirname(__file__)
+        config_full_path = os.path.join(script_dir, config_path)
+        with open(config_full_path, "r", encoding="utf-8") as f:
             self.config = yaml.safe_load(f)
+
         self.backtest_cfg = self.config.get("backtest", {})
         self.trading_cfg = self.config.get("trading", {})
+
+        # 初始化 Qdrant 客户端和 Embedding 模型 (只在这里初始化一次)
+        self.qdrant_client, self.embedding_model = update_kb_main()
         
-        # 初始化 PortfolioManager
-        self.portfolio = PortfolioManager(config_path=config_path, db_path=db_path)
-        self.risk_gate = RiskGate(self.config)
-        
-        # 结果存储
-        self.equity_curve = []
-        self.benchmark_curve = []
-        self.trade_log = []
+        # 创建 KnowledgeBaseUpdater 实例并更新知识库
+        updater = KnowledgeBaseUpdater(config_path=config_path, qdrant_client=self.qdrant_client, embedding_model=self.embedding_model)
+        updater.update_knowledge_base()
 
-    def _load_data(self) -> pd.DataFrame:
-        data_file = self.backtest_cfg.get("data_file", "data/historical_quotes_5y.csv")
-        try:
-            df = pd.read_csv(data_file)
-        except FileNotFoundError:
-            logging.error(f"找不到历史行情文件: {data_file}")
-            return pd.DataFrame()
-            
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values(["date", "symbol"]).reset_index(drop=True)
+        self.portfolio = PortfolioManager(config_path=config_path)
+        # 将已初始化的 Qdrant 客户端和 Embedding 模型传递给 RiskGate
+        self.risk_gate = RiskGate(config=self.config, qdrant_client=self.qdrant_client, embedding_model=self.embedding_model)
 
-        start_date = self.backtest_cfg.get("start_date", "2018-01-01")
-        end_date = self.backtest_cfg.get("end_date", "2024-12-31")
-        df = df[(df["date"] >= pd.to_datetime(start_date)) & (df["date"] <= pd.to_datetime(end_date))]
-        return df
+        self.daily_metrics = []
+        self.transactions = []
+        self.load_data()
 
-    def _load_benchmark(self) -> pd.DataFrame:
-        benchmark_file = "data/benchmark_hs300.csv"
-        try:
-            df = pd.read_csv(benchmark_file)
-            df["date"] = pd.to_datetime(df["date"])
-            return df.sort_values("date")
-        except:
-            logging.warning("Benchmark data not found, skipping benchmark comparison.")
-            return pd.DataFrame()
+    def load_data(self):
+        logging.info("Loading historical data...")
+        self.stock_data = pd.read_csv(self.config["data"]["historical_quotes_path"], index_col=0, parse_dates=True)
+        self.stock_data = self.stock_data.loc[self.backtest_cfg["start_date"]:self.backtest_cfg["end_date"]]
 
-    def _pick_candidate(self, history_window: pd.DataFrame, latest_day: pd.DataFrame):
-        lookback = int(self.backtest_cfg.get("lookback_days", 20))
-        win_threshold = float(self.backtest_cfg.get("min_momentum", 0.02)) # 调低阈值以产生交易
+        self.benchmark_data = pd.read_csv(self.config["data"]["benchmark_quotes_path"], index_col=0, parse_dates=True)
+        self.benchmark_data = self.benchmark_data.loc[self.backtest_cfg["start_date"]:self.backtest_cfg["end_date"]]
+        logging.info("Historical data loaded.")
 
-        candidates = []
-        for _, row in latest_day.iterrows():
-            symbol = row["symbol"]
-            closes = history_window[history_window["symbol"] == symbol]["close"].tail(lookback + 1)
-            if len(closes) < lookback + 1:
-                continue
-            base = closes.iloc[0]
-            latest = closes.iloc[-1]
-            momentum = (latest / base) - 1.0
-            if momentum >= win_threshold:
-                candidates.append({
-                    "symbol": symbol,
-                    "name": row["name"],
-                    "price": float(latest),
-                    "momentum": float(momentum),
-                })
-        
-        if not candidates:
-            return None
-        # 按动量排序，取最强的
-        candidates.sort(key=lambda x: x["momentum"], reverse=True)
-        return candidates[0]
+    def calculate_momentum(self, data):
+        # 计算动量因子
+        return data["close"].pct_change(periods=self.config["strategy"]["momentum_window"]).iloc[-1]
 
-    def _detect_market_regime(self, current_date: datetime, benchmark_df: pd.DataFrame) -> str:
-        """根据基准指数表现判断市场状态"""
-        if benchmark_df.empty:
+    def get_market_regime(self, current_date):
+        # 简化市场状态判断：基于基准指数过去N天的涨跌幅
+        lookback_days = 60 # 两个月
+        if len(self.benchmark_data.loc[:current_date]) < lookback_days:
             return "range_bound"
+        
+        recent_benchmark = self.benchmark_data.loc[:current_date].iloc[-lookback_days:]
+        change = (recent_benchmark["close"].iloc[-1] - recent_benchmark["close"].iloc[0]) / recent_benchmark["close"].iloc[0]
 
-        # 考虑过去一段时间的基准收益率
-        lookback_period = 60  # 例如，看过去60天的表现
-        start_date = current_date - timedelta(days=lookback_period)
-        recent_benchmark = benchmark_df[(benchmark_df["date"] >= start_date) & (benchmark_df["date"] <= current_date)]
-
-        if len(recent_benchmark) < lookback_period / 2:
-            return "range_bound"
-
-        # 计算这段时间的累计收益率
-        initial_price = recent_benchmark.iloc[0]["close"]
-        final_price = recent_benchmark.iloc[-1]["close"]
-        cumulative_return = (final_price / initial_price) - 1
-
-        # 简单判断：
-        # 牛市：累计收益率 > 5%
-        # 熊市：累计收益率 < -5%
-        # 震荡市：介于两者之间
-        if cumulative_return > 0.05:
+        if change > 0.10: # 涨幅超过10%视为牛市
             return "bull"
-        elif cumulative_return < -0.05:
+        elif change < -0.10: # 跌幅超过10%视为熊市
             return "bear"
         else:
             return "range_bound"
 
-    def run(self):
-        df = self._load_data()
-        benchmark_df = self._load_benchmark()
-        if df.empty:
-            logging.warning("历史行情数据为空，跳过回测。")
-            return
+    def run_backtest(self):
+        logging.info("Starting backtest...")
+        dates = self.stock_data.index.unique().sort_values()
 
-        target_return = float(self.trading_cfg.get("target_return", 0.15))
-        stop_loss_pct = abs(float(self.trading_cfg.get("stop_loss", -0.05)))
-        
-        # 滑点模拟：买入价增加 0.1%，卖出价减少 0.1%
-        slippage = 0.001 
+        for current_date in dates:
+            current_date_str = current_date.strftime("%Y-%m-%d")
+            logging.info(f"Processing date: {current_date_str}")
 
-        all_days = sorted(df["date"].dt.date.unique())
-        
-        for day in all_days:
-            now = datetime.combine(day, datetime.min.time()).replace(hour=14, minute=55)
-            day_slice = df[df["date"].dt.date == day]
-            day_prices = {r["symbol"]: float(r["close"]) for _, r in day_slice.iterrows()}
+            daily_data = self.stock_data.loc[current_date]
+            if isinstance(daily_data, pd.Series): # Handle single stock case
+                daily_data = pd.DataFrame([daily_data])
+            daily_data = daily_data.set_index("code")
 
-            # 1. 更新市场状态
-            market_regime = self._detect_market_regime(now, benchmark_df)
+            # 更新持仓状态和检查止损止盈
+            self.portfolio.update_positions(current_date, daily_data)
+
+            # 获取市场状态
+            market_regime = self.get_market_regime(current_date)
             self.portfolio.set_market_regime(market_regime)
 
-            # 2. 更新价格并处理卖出
-            self.portfolio.update_market_prices(day_prices)
+            # 卖出逻辑
+            for stock_code in list(self.portfolio.positions.keys()): # Iterate over a copy
+                position = self.portfolio.positions[stock_code]
+                current_price = daily_data.loc[stock_code]["close"] if stock_code in daily_data.index else None
+
+                if current_price is None:
+                    logging.warning(f"[{stock_code}] {current_date_str}: 无法获取最新价格，跳过卖出检查。")
+                    continue
+
+                # 止损
+                if (current_price - position["buy_price"]) / position["buy_price"] < self.config["strategy"]["stop_loss"]:
+                    self.portfolio.sell(stock_code, current_price, "Stop Loss", self.config["trade_costs"]["slippage_rate"], self.config["trade_costs"]["commission_rate"], self.config["trade_costs"]["stamp_tax_rate"])
+                    self.transactions.append({"date": current_date, "code": stock_code, "type": "SELL", "price": current_price, "shares": position["shares"], "reason": "Stop Loss"})
+                    continue
+
+                # 止盈
+                if (current_price - position["buy_price"]) / position["buy_price"] > self.config["strategy"]["target_return"]:
+                    self.portfolio.sell(stock_code, current_price, "Target Return", self.config["trade_costs"]["slippage_rate"], self.config["trade_costs"]["commission_rate"], self.config["trade_costs"]["stamp_tax_rate"])
+                    self.transactions.append({"date": current_date, "code": stock_code, "type": "SELL", "price": current_price, "shares": position["shares"], "reason": "Target Return"})
+                    continue
+                
+                # 最大持仓天数
+                if (current_date - position["buy_date"]).days > self.config["strategy"]["max_holding_days"]:
+                    self.portfolio.sell(stock_code, current_price, "Max Holding Days", self.config["trade_costs"]["slippage_rate"], self.config["trade_costs"]["commission_rate"], self.config["trade_costs"]["stamp_tax_rate"])
+                    self.transactions.append({"date": current_date, "code": stock_code, "type": "SELL", "price": current_price, "shares": position["shares"], "reason": "Max Holding Days"})
+                    continue
+
+            # 买入逻辑
+            candidate_stocks = []
+            for stock_code in daily_data.index:
+                if stock_code not in self.portfolio.positions and len(self.stock_data.loc[self.stock_data['code'] == stock_code]) > self.config["strategy"]["momentum_window"]:
+                    stock_momentum = self.calculate_momentum(self.stock_data.loc[self.stock_data['code'] == stock_code])
+                    if stock_momentum > self.config["strategy"]["min_momentum"]:
+                        candidate_stocks.append((stock_code, stock_momentum))
             
-            # 模拟卖出滑点
-            positions = self.portfolio.db.get_positions()
-            for p in positions:
-                if p['symbol'] in day_prices:
-                    original_price = day_prices[p['symbol']]
-                    day_prices[p['symbol']] = original_price * (1 - slippage)
-            
-            exit_actions = self.portfolio.process_exits(now=now)
-            
-            # 3. 记录每日资产
-            acc = self.portfolio.db.get_account()
-            self.equity_curve.append({
-                "date": day,
-                "total_assets": acc["total_assets"],
-                "cash": acc["balance"]
+            # 按动量从高到低排序
+            candidate_stocks.sort(key=lambda x: x[1], reverse=True)
+
+            for stock_code, momentum in candidate_stocks:
+                if len(self.portfolio.positions) < self.config["strategy"]["max_positions"]:
+                    current_price = daily_data.loc[stock_code]["close"]
+                    
+                    # 风险门禁检查
+                    blocked_reason = self.risk_gate.buy_blocked_reason(stock_code, current_date_str, current_price)
+                    if blocked_reason:
+                        logging.warning(f"[{stock_code}] {current_date_str}: {blocked_reason}")
+                        continue
+
+                    # 尝试买入
+                    shares_to_buy = self.portfolio.calculate_shares_to_buy(stock_code, current_price)
+                    if shares_to_buy > 0:
+                        self.portfolio.buy(stock_code, current_price, shares_to_buy, current_date, self.config["trade_costs"]["slippage_rate"], self.config["trade_costs"]["commission_rate"], self.config["trade_costs"]["stamp_tax_rate"])
+                        self.transactions.append({"date": current_date, "code": stock_code, "type": "BUY", "price": current_price, "shares": shares_to_buy, "reason": "Momentum"})
+
+            # 记录每日指标
+            current_portfolio_value = self.portfolio.get_portfolio_value(current_date, daily_data)
+            benchmark_value = self.benchmark_data.loc[current_date]["close"] if current_date in self.benchmark_data.index else np.nan
+            self.daily_metrics.append({
+                "date": current_date,
+                "portfolio_value": current_portfolio_value,
+                "cash": self.portfolio.cash,
+                "total_assets": self.portfolio.total_assets,
+                "benchmark_value": benchmark_value
             })
-            
-            # 记录基准
-            b_val = benchmark_df[benchmark_df["date"].dt.date == day]
-            if not b_val.empty:
-                self.benchmark_curve.append({
-                    "date": day,
-                    "close": b_val.iloc[0]["close"]
-                })
 
-            # 4. 检查买入门禁
-            positions = self.portfolio.db.get_positions()
-            # 模拟 NotebookLM 和 local_rag 都失败，降级到 pure_quant 决策
-            mock_decision = {"decision_source": "pure_quant", "success": True}
-            buy_blocked_reason = self.risk_gate.buy_blocked_reason(mock_decision, len(positions))
-            if buy_blocked_reason:
-                logging.info(f"[{day.strftime('%Y-%m-%d')}] 阻止买入: {buy_blocked_reason}")
-                continue
-
-            # 5. 寻找候选标的
-            history_window = df[df["date"].dt.date <= day]
-            candidate = self._pick_candidate(history_window, day_slice)
-            if not candidate:
-                continue
-
-            # 6. 执行买入（含滑点），position_pct 不再直接传递
-            buy_price = candidate["price"] * (1 + slippage)
-            
-            self.portfolio.buy(
-                symbol=candidate["symbol"],
-                name=candidate["name"],
-                price=buy_price,
-                reason=f"Momentum {candidate['momentum']:.2%}",
-                trade_time=now,
-            )
-
-        self.analyze_results()
+        logging.info("Backtest finished.")
+        self.daily_metrics_df = pd.DataFrame(self.daily_metrics).set_index("date")
+        self.daily_metrics_df["portfolio_return"] = self.daily_metrics_df["portfolio_value"].pct_change().fillna(0)
+        self.daily_metrics_df["benchmark_return"] = self.daily_metrics_df["benchmark_value"].pct_change().fillna(0)
+        self.daily_metrics_df["cumulative_portfolio_return"] = (1 + self.daily_metrics_df["portfolio_return"]).cumprod() - 1
+        self.daily_metrics_df["cumulative_benchmark_return"] = (1 + self.daily_metrics_df["benchmark_return"]).cumprod() - 1
 
     def analyze_results(self):
-        if not self.equity_curve:
+        if self.daily_metrics_df.empty:
+            logging.warning("No daily metrics to analyze.")
             return
-            
-        equity_df = pd.DataFrame(self.equity_curve)
-        equity_df["date"] = pd.to_datetime(equity_df["date"])
-        equity_df.set_index("date", inplace=True)
-        
-        # 计算收益率
-        equity_df["returns"] = equity_df["total_assets"].pct_change().fillna(0)
-        equity_df["cum_returns"] = (1 + equity_df["returns"]).cumprod() - 1
-        
-        # 计算基准收益率
-        if self.benchmark_curve:
-            bench_df = pd.DataFrame(self.benchmark_curve)
-            bench_df["date"] = pd.to_datetime(bench_df["date"])
-            bench_df.set_index("date", inplace=True)
-            bench_df["returns"] = bench_df["close"].pct_change().fillna(0)
-            bench_df["cum_returns"] = (1 + bench_df["returns"]).cumprod() - 1
-            # 对齐
-            equity_df["benchmark_cum_returns"] = bench_df["cum_returns"]
-            equity_df["benchmark_returns"] = bench_df["returns"]
 
-        # 核心指标
-        total_return = equity_df["cum_returns"].iloc[-1]
-        days = (equity_df.index[-1] - equity_df.index[0]).days
-        annual_return = (1 + total_return) ** (365.0 / days) - 1
-        
-        volatility = equity_df["returns"].std() * np.sqrt(244)
-        risk_free_rate = 0.02
-        sharpe = (annual_return - risk_free_rate) / volatility if volatility != 0 else 0
-        
-        rolling_max = equity_df["total_assets"].cummax()
-        drawdown = (equity_df["total_assets"] - rolling_max) / rolling_max
+        # 年化收益
+        total_days = (self.daily_metrics_df.index[-1] - self.daily_metrics_df.index[0]).days
+        annual_factor = 252 / total_days # 假设每年252个交易日
+        annual_portfolio_return = (1 + self.daily_metrics_df["portfolio_return"]).prod()**(annual_factor) - 1
+        annual_benchmark_return = (1 + self.daily_metrics_df["benchmark_return"]).prod()**(annual_factor) - 1
+
+        # 年化波动率
+        annual_portfolio_volatility = self.daily_metrics_df["portfolio_return"].std() * np.sqrt(252)
+        annual_benchmark_volatility = self.daily_metrics_df["benchmark_return"].std() * np.sqrt(252)
+
+        # 夏普比率 (假设无风险利率为0)
+        sharpe_ratio = annual_portfolio_return / annual_portfolio_volatility if annual_portfolio_volatility != 0 else 0
+
+        # 最大回撤
+        peak = self.daily_metrics_df["cumulative_portfolio_return"].expanding(min_periods=1).max()
+        drawdown = (self.daily_metrics_df["cumulative_portfolio_return"] - peak) / (peak + 1)
         max_drawdown = drawdown.min()
-        calmar = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
-        
-        print("\n" + "="*30)
-        print("   BACKTEST PERFORMANCE")
-        print("="*30)
-        print(f"Total Return:     {total_return:.2%}")
-        print(f"Annual Return:    {annual_return:.2%}")
-        print(f"Max Drawdown:     {max_drawdown:.2%}")
-        print(f"Sharpe Ratio:     {sharpe:.2f}")
-        print(f"Calmar Ratio:     {calmar:.2f}")
-        
-        # 市场状态表现
-        if "benchmark_returns" in equity_df:
-            # 定义市场状态：基准收益率 > 0.5% 牛市， < -0.5% 熊市，其他震荡
-            equity_df['market_state'] = 'Vibrate'
-            equity_df.loc[equity_df['benchmark_returns'] > 0.005, 'market_state'] = 'Bull'
-            equity_df.loc[equity_df['benchmark_returns'] < -0.005, 'market_state'] = 'Bear'
-            
-            state_perf = equity_df.groupby('market_state')['returns'].mean() * 244
-            print("\nMarket State Performance (Annualized):")
-            for state, perf in state_perf.items():
-                print(f"{state}: {perf:.2%}")
-        
-        self.plot_results(equity_df, drawdown)
 
-    def plot_results(self, equity_df, drawdown):
-        plt.figure(figsize=(15, 15))
-        
-        # 1. 累计收益曲线
-        plt.subplot(4, 1, 1)
-        plt.plot(equity_df.index, equity_df["cum_returns"] * 100, label="Strategy", color='blue')
-        if "benchmark_cum_returns" in equity_df:
-            plt.plot(equity_df.index, equity_df["benchmark_cum_returns"] * 100, label="Benchmark (HS300)", color='gray', linestyle='--')
-        plt.title("Cumulative Returns (%)")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+        # 卡玛比率
+        calmar_ratio = annual_portfolio_return / abs(max_drawdown) if abs(max_drawdown) != 0 else 0
 
-        # 2. 回撤曲线
-        plt.subplot(4, 1, 2)
-        plt.fill_between(equity_df.index, drawdown * 100, 0, color='red', alpha=0.3)
-        plt.title("Drawdown (%)")
-        plt.grid(True, alpha=0.3)
+        # Alpha (简化计算，假设Beta为1)
+        alpha = annual_portfolio_return - annual_benchmark_return
 
-        # 3. 月度收益热力图
-        plt.subplot(4, 1, 3)
-        monthly_returns = equity_df["returns"].resample('ME').apply(lambda x: (1 + x).prod() - 1)
-        monthly_df = pd.DataFrame({
-            'Year': monthly_returns.index.year,
-            'Month': monthly_returns.index.month,
-            'Return': monthly_returns.values
+        logging.info("\n--- 回测结果概览 ---")
+        logging.info(f"初始资金: {self.config['backtest']['initial_capital']:.2f}")
+        logging.info(f'最终资产: {self.daily_metrics_df["total_assets"].iloc[-1]:.2f}')
+        logging.info(f'总收益率: {self.daily_metrics_df["cumulative_portfolio_return"].iloc[-1]:.2%}')
+        logging.info(f'年化收益率: {annual_portfolio_return:.2%}')
+        logging.info(f'基准年化收益率: {annual_benchmark_return:.2%}')
+        logging.info(f'年化波动率: {annual_portfolio_volatility:.2%}')
+        logging.info(f'夏普比率: {sharpe_ratio:.2f}')
+        logging.info(f'最大回撤: {max_drawdown:.2%}')
+        logging.info(f'卡玛比率: {calmar_ratio:.2f}')
+        logging.info(f'Alpha: {alpha:.2%}')
+
+        # 月度收益热力图
+        monthly_returns = self.daily_metrics_df["portfolio_return"].resample("M").apply(lambda x: (1 + x).prod() - 1)
+        monthly_returns_df = pd.DataFrame({
+            "year": monthly_returns.index.year,
+            "month": monthly_returns.index.month,
+            "return": monthly_returns
         })
-        pivot_table = monthly_df.pivot(index='Year', columns='Month', values='Return')
-        sns.heatmap(pivot_table, annot=True, fmt=".1%", cmap="RdYlGn", center=0)
-        plt.title("Monthly Returns Heatmap")
+        monthly_returns_pivot = monthly_returns_df.pivot("year", "month", "return")
 
-        # 4. 市场状态表现
-        if 'market_state' in equity_df:
-            plt.subplot(4, 1, 4)
-            state_perf = equity_df.groupby('market_state')['returns'].mean() * 244
-            state_perf.plot(kind='bar', color=['red', 'green', 'blue'])
-            plt.title("Annualized Return by Market State")
-            plt.ylabel("Return")
+        plt.figure(figsize=(12, 8))
+        sns.heatmap(monthly_returns_pivot, annot=True, fmt=".2%", cmap="RdYlGn", center=0)
+        plt.title("月度收益热力图")
+        plt.xlabel("月份")
+        plt.ylabel("年份")
+        plt.tight_layout()
+        plt.savefig("monthly_returns_heatmap.png")
+        plt.close()
+
+        # 累计收益曲线
+        plt.figure(figsize=(12, 6))
+        plt.plot(self.daily_metrics_df.index, self.daily_metrics_df["cumulative_portfolio_return"], label='策略累计收益')
+        plt.plot(self.daily_metrics_df.index, self.daily_metrics_df["cumulative_benchmark_return"], label='基准累计收益 (沪深300)')
+        plt.title('策略与基准累计收益曲线')
+        plt.xlabel('日期')
+        plt.ylabel('累计收益率')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("cumulative_returns.png")
+        plt.close()
+
+        # 回撤曲线
+        plt.figure(figsize=(12, 6))
+        plt.plot(self.daily_metrics_df.index, drawdown, label='策略回撤')
+        plt.title('策略回撤曲线')
+        plt.xlabel('日期')
+        plt.ylabel('回撤')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("drawdown_curve.png")
+        plt.close()
+
+        # 市场状态表现
+        market_regime_returns = {"bull": [], "bear": [], "range_bound": []}
+        for date, row in self.daily_metrics_df.iterrows():
+            regime = self.get_market_regime(date)
+            market_regime_returns[regime].append(row["portfolio_return"])
+        
+        logging.info("\n--- 分市场状态表现 (年化收益) ---")
+        for regime, returns in market_regime_returns.items():
+            if returns:
+                total_regime_days = len(returns)
+                regime_annual_factor = 252 / total_regime_days if total_regime_days > 0 else 0
+                annual_regime_return = (1 + pd.Series(returns)).prod()**(regime_annual_factor) - 1 if regime_annual_factor > 0 else 0
+                logging.info(f'{regime.capitalize()}市场: {annual_regime_return:.2%}')
+            else:
+                logging.info(f'{regime.capitalize()}市场: 无数据')
+
+    def plot_results(self):
+        # 合并所有图表到一个报告图片
+        fig, axes = plt.subplots(nrows=4, ncols=1, figsize=(15, 25))
+        
+        # 累计收益曲线
+        axes[0].plot(self.daily_metrics_df.index, self.daily_metrics_df["cumulative_portfolio_return"], label='策略累计收益')
+        axes[0].plot(self.daily_metrics_df.index, self.daily_metrics_df["cumulative_benchmark_return"], label='基准累计收益 (沪深300)')
+        axes[0].set_title('策略与基准累计收益曲线')
+        axes[0].set_xlabel('日期')
+        axes[0].set_ylabel('累计收益率')
+        axes[0].legend()
+        axes[0].grid(True)
+
+        # 回撤曲线
+        peak = self.daily_metrics_df["cumulative_portfolio_return"].expanding(min_periods=1).max()
+        drawdown = (self.daily_metrics_df["cumulative_portfolio_return"] - peak) / (peak + 1)
+        axes[1].plot(self.daily_metrics_df.index, drawdown, label='策略回撤')
+        axes[1].set_title('策略回撤曲线')
+        axes[1].set_xlabel('日期')
+        axes[1].set_ylabel('回撤')
+        axes[1].legend()
+        axes[1].grid(True)
+
+        # 月度收益热力图
+        monthly_returns = self.daily_metrics_df["portfolio_return"].resample("M").apply(lambda x: (1 + x).prod() - 1)
+        monthly_returns_df = pd.DataFrame({
+            'year': monthly_returns.index.year,
+            'month': monthly_returns.index.month,
+            'return': monthly_returns
+        })
+        monthly_returns_pivot = monthly_returns_df.pivot("year", "month", "return")
+        sns.heatmap(monthly_returns_pivot, annot=True, fmt=".2%", cmap="RdYlGn", center=0, ax=axes[2])
+        axes[2].set_title("月度收益热力图")
+        axes[2].set_xlabel("月份")
+        axes[2].set_ylabel("年份")
+
+        # 每日资产价值
+        axes[3].plot(self.daily_metrics_df.index, self.daily_metrics_df["total_assets"], label='总资产')
+        axes[3].set_title('每日总资产价值')
+        axes[3].set_xlabel('日期')
+        axes[3].set_ylabel('资产价值')
+        axes[3].legend()
+        axes[3].grid(True)
 
         plt.tight_layout()
         plt.savefig("backtest_report.png")
-        print("\nReport saved as backtest_report.png")
+        plt.close()
+
 
 if __name__ == "__main__":
     tester = HistoricalBacktester()
-    tester.run()
+    tester.run_backtest()
+    tester.analyze_results()
+    tester.plot_results()
